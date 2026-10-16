@@ -9,20 +9,24 @@ Ouroboros is a personal, local engineering harness. It turns a scoped task in an
 Authoritative documents (read the relevant section before changing behaviour):
 - Design spec: `docs/superpowers/specs/2026-10-13-ouroboros-design.md`
 - Implementation plan (Tasks 1–18, gates A–D, pinned versions, operational defaults, file map): `docs/superpowers/plans/2026-10-13-ouroboros-implementation.md`
-- Execution ledger, review reports, snapshots and evidence: `.superpowers/sdd/2026-10-13-ouroboros-implementation/` (`progress.md` is the running log of which task is current and what is stale).
+- Status and open review findings: `docs/status/progress.md` (tracked; what is next, what is stale, where each check can run) and `docs/status/review-*.md`. Read `progress.md` before picking up work, and update it in the same PR as the work.
+- The raw execution ledger, receipts and prepared manifests live only on the Windows machine under `.superpowers/sdd/2026-10-13-ouroboros-implementation/` (gitignored). Cloud sessions don't have it.
 
 ## Commands
 
-Run from `D:\ouroboros` on Windows (Node `24.19.0`, `save-exact=true`; never upgrade a pin silently).
+The user's machine is `D:\ouroboros` on Windows. Cloud sessions are Linux, and `.claude/hooks/session-start.sh` installs the pinned Node and both npm trees there. Node is `24.19.0` with `save-exact=true`; never upgrade a pin silently.
 
 ```
 npm run build        # tsc + copy src/store/schema.sql into dist/
-npm run typecheck    # tsc --noEmit
-npm test             # vitest run (tests/**/*.test.ts, excludes tests/live/**)
+npm run typecheck    # tsc --noEmit (src/** only; tests are not type-checked)
+npm test             # vitest run (tests/**/*.test.ts, excludes tests/live/**) — Windows only
+npm run test:portable # same minus the Windows-only files listed in vitest.portable.config.ts — use this on Linux
 npx vitest run tests/store.test.ts            # single file
 npx vitest run tests/codex-adapter.test.ts -t review1_   # filter by test name
 npm run dev -- doctor [--json]                # run CLI from source (strip-types)
 ```
+
+On Linux, the Windows-only test files fail and write backslash-named fixture files into the repo root. Run them only on Windows.
 
 - `tests/live/**` is excluded by default. Live provider qualification goes through `ouroboros doctor --qualify --provider codex --environment windows --fixture-root <fresh-absolute-root> --model <model>`, not by enabling Vitest.
 - Rust supervisor: `native/supervisor` (toolchain pinned to 1.98.1, exact crate pins). `tests/supervisor-native.integration.test.ts` expects `native/supervisor/target/debug/ouroboros-supervisor.exe` to be built (`cargo build`).
@@ -31,9 +35,11 @@ npm run dev -- doctor [--json]                # run CLI from source (strip-types
 
 ## Process rules for this repo (from the plan)
 
-- Git history is initialized. Do not commit, push, or touch the user's source checkouts without explicit authorization.
+- Commit and push only to the session's own branch, and deliver through a PR. Never push to `main` and never force-push. Never touch the user's source checkouts or any target repository.
 - Per task: write the named tests, run the named check once to get a meaningful RED, implement, then rerun only the failed check. Stop after two unsuccessful corrective candidates.
-- Don't rerun the aggregate suite or already-passing checks to "confirm". A change that invalidates a passing check makes it stale (`NEEDS_REVALIDATION`), and rerunning it needs the user's explicit, narrow authorization.
+- Don't rerun the aggregate suite or already-passing checks to "confirm". A change that invalidates a passing check makes it stale (`NEEDS_REVALIDATION`), and rerunning it needs the user's explicit, narrow authorization. Rerunning the checks a change directly affects is part of that change.
+- CI (`.github/workflows/ci.yml`) runs the full deterministic suite on every PR: Windows for everything, Linux for the portable suite and compile checks. CI results are hosted-CI evidence. They never stand in for a task receipt, a qualification or live acceptance.
+- Workflow: the `next-task` skill picks the next item from `progress.md` and runs the `sol-engineer` and `sol-reviewer` subagents (the plan's engineer/worker and reviewer roles). The `steward` skill covers driving PRs to green.
 - Never run live provider/model/sandbox/auth operations, change host configuration or provider login, or install system packages implicitly.
 - No shared `utils.ts` or plugin framework. Each module owns its files per the plan's file map.
 
@@ -47,7 +53,7 @@ A Windows TypeScript controller owns task contracts, snapshots, verification, li
 - `native/supervisor/`: Rust process owner. On Windows it uses Job Objects (`windows.rs`). On Linux/WSL it uses systemd units/cgroups via zbus (`linux.rs`).
 - `src/providers/`: a common `ProviderAdapter` contract (`provider.ts`).
   - `codex/` is native Windows Codex app-server over stdio (`transport.ts`, approval `policy.ts`, `adapter.ts`).
-  - `claude/` is the Windows side of a framed stdio bridge (`frames.ts`) to `adapters/claude/`, the trusted WSL-local Agent SDK session with explicit options, a first-yield gate and pre-tool enforcement.
+  - `claude/` is the Windows side of a framed stdio bridge (`frames.ts`) to `adapters/claude/`, the trusted WSL-local Agent SDK session with explicit options, a first-yield gate and pre-tool enforcement. The options projection both sides share lives in `src/providers/claude/options.ts`; `adapters/claude/src/options.ts` re-exports it. The bridge imports `src/` but `src/` never imports the bridge, because the root `rootDir` is `src`.
   - Interrupt acknowledgement starts drainage. It doesn't prove execution has stopped.
 - `src/qualification/`: the versioned capability ledger and explicit probes. A provider/environment path can't be used autonomously until it has its own qualification receipt. Native Codex and WSL Claude are the required paths. Native Claude autonomous execution is excluded.
 - `src/cli/`: `main.ts` dispatches `doctor` (passive diagnostics) and `doctor --qualify`.
