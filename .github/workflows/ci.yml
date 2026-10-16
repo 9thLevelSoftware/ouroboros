@@ -1,0 +1,56 @@
+# Hosted CI is its own evidence class: it never stands in for a task receipt or a live qualification.
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows (full deterministic suite, native helper)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Build supervisor (pinned toolchain via rust-toolchain.toml)
+        run: cargo build --locked --manifest-path native/supervisor/Cargo.toml
+      - name: Supervisor ownership tests
+        run: cargo test --locked --manifest-path native/supervisor/Cargo.toml --test windows_ownership
+      - run: npm test
+
+  linux:
+    name: Linux (portable suite, WSL bridge and helper compile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            adapters/claude/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:portable
+      - name: Compile WSL Claude bridge against pinned SDK
+        working-directory: adapters/claude
+        run: |
+          npm ci
+          npx tsc -p tsconfig.json --noEmit
+      # linux_ownership needs a systemd user manager and explicit WSL setup; it stays a manual, authorized run.
+      - name: Compile Linux supervisor backend
+        run: cargo build --locked --manifest-path native/supervisor/Cargo.toml

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(npm run typecheck)",
+      "Bash(npm run build)",
+      "Bash(npm run test:portable)",
+      "Bash(npx vitest run *)",
+      "Bash(npx vitest list *)"
+    ],
+    "ask": [
+      "Edit(docs/superpowers/specs/**)",
+      "Bash(npm run dev -- doctor --qualify*)",
+      "Bash(node dist/cli/main.js doctor --qualify*)",
+      "Bash(npm run acceptance:live*)",
+      "Bash(npx vitest run tests/live*)",
+      "Bash(cargo test --manifest-path native/supervisor/Cargo.toml --test linux_ownership*)",
+      "Bash(codex *)",
+      "Bash(codex.exe *)",
+      "Bash(claude *)",
+      "Bash(wsl *)",
+      "Bash(wsl.exe *)",
+      "Bash(systemd-run *)"
+    ],
+    "deny": [
+      "Edit(src/providers/codex/protocol/**)",
+      "Bash(git push --force*)",
+      "Bash(git push -f *)",
+      "Bash(git push origin main*)",
+      "Bash(git push origin HEAD:main*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-start.sh",
+            "timeout": 600,
+            "statusMessage": "Installing pinned Node and dependencies"
+          }
+        ]
+      }
+    ]
+  }
+}

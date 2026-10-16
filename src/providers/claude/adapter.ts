@@ -5,7 +5,7 @@ import type { Result } from '../../contracts/common.ts';
 import { DrainEvidenceSchema, OwnershipReceiptSchema, LaunchSpecSchema, type LaunchSpec, type OwnedExecution,
   type ExecutionOwner, type OwnershipReceipt, type DrainEvidence } from '../../contracts/execution.ts';
 import type { ArtifactRef, ProviderAdapter, ProviderStart, ProviderResume, ProviderSession, ProviderEvent, ExecutionInventory } from '../provider.ts';
-import { ClaudeStartSchema, contains, createClaudeOptions, projectEnvironment, sameOwner } from '../../../adapters/claude/src/options.ts';
+import { ClaudeStartSchema, contains, createClaudeOptions, projectEnvironment, sameOwner } from './options.ts';
 import { ClaudeFrameDecoder, encodeClaudeFrame, MAX_CLAUDE_OUTPUT, type BridgeBody, type ClaudeFrame, type SafeAccount } from './frames.ts';
 
 const hash=(value:string|Uint8Array)=>createHash('sha256').update(value).digest('hex');
