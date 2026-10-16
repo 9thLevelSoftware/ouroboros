@@ -1,0 +1,2 @@
+# Preserve source and generated protocol bytes for qualification/provenance hashes.
+* -text

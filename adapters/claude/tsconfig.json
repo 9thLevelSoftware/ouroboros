@@ -1,0 +1,8 @@
+{
+  "compilerOptions": {
+    "target": "ES2024", "module": "NodeNext", "moduleResolution": "NodeNext", "strict": true,
+    "rootDir": "../..", "outDir": "dist", "rewriteRelativeImportExtensions": true,
+    "erasableSyntaxOnly": true, "types": ["node"]
+  },
+  "include": ["src/main.ts", "src/options.ts", "src/session.ts"]
+}
