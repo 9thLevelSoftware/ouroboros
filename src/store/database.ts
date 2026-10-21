@@ -1,3 +1,4 @@
+import { nativeDependencyFailure } from '../runtime/compatibility.ts';
 import Database from 'better-sqlite3';
 import { z } from 'zod';
 import { randomUUID, createHash } from 'node:crypto';
@@ -20,7 +21,7 @@ function decode<T>(row: unknown, schema: { parse(value: unknown): T }): T { retu
 export const QualificationEnvelopeSchema = z.strictObject({
   schemaVersion: z.literal(1), id: IdSchema, runId: IdSchema, generation: BytesSchema,
   actionId: IdSchema, requestId: IdSchema, targetHash: HashSchema,
-  kind: z.enum(['REQUEST', 'ATTEMPT_INTENT', 'ATTEMPT_RESULT', 'REPORT']), payload: z.json(),
+  kind: z.enum(['REQUEST', 'ATTEMPT_INTENT', 'ATTEMPT_RESULT', 'REPORT', 'CAMPAIGN', 'BATCH_APPROVAL', 'CAMPAIGN_DISPATCH', 'CAMPAIGN_RESULT', 'CAMPAIGN_FENCE', 'CAMPAIGN_RECONCILIATION', 'CAMPAIGN_ACCOUNTING']), payload: z.json(),
 });
 export type QualificationEnvelope = z.infer<typeof QualificationEnvelopeSchema>;
 
@@ -32,7 +33,8 @@ export class RunStore {
     mkdirSync(this.root, { recursive: true });
     mkdirSync(join(this.root, 'artifacts'), { recursive: true });
     mkdirSync(join(this.root, 'temporary'), { recursive: true });
-    this.#db = new Database(join(this.root, 'store.sqlite'));
+    try { this.#db = new Database(join(this.root, 'store.sqlite')); }
+    catch(error) { throw nativeDependencyFailure(error)??error; }
     this.#db.pragma('foreign_keys = ON'); this.#db.pragma('journal_mode = WAL'); this.#db.pragma('synchronous = FULL'); this.#db.pragma('busy_timeout = 5000');
     try {
       this.#db.transaction(() => {
@@ -84,24 +86,59 @@ export class RunStore {
     return this.#atomic(() => { if (this.#db.prepare('SELECT 1 FROM runs WHERE id = ?').get(input.id)) fail('DUPLICATE_RUN', 'Run ID already exists'); this.#db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?, ?)').run(input.id, repoId, 0, JSON.stringify(parsed.value), JSON.stringify(parsedLimits.value)); return parsed.value; });
   }
   loadRun(id: string): Result<RunRecord> { return this.#atomic(() => this.#run(id)); }
+  /** Controller-owned progress only; action state and qualification stay separate. */
+  updateRunState(owner: OwnerToken, input: { phase: RunRecord['phase']; blocker?: RunRecord['blocker']; baselineRef?: string; candidateRef?: string }): Result<RunRecord> {
+    const update = z.strictObject({ phase: RunRecordSchema.shape.phase, blocker: RunRecordSchema.shape.blocker.optional(), baselineRef: IdSchema.optional(), candidateRef: IdSchema.optional() }).safeParse(input);
+    if (!update.success) return storeError('INVALID_CONTRACT', 'Invalid run progress update');
+    return this.#atomic(() => {
+      const run = this.#fence(owner);
+      for (const ref of [update.data.baselineRef, update.data.candidateRef]) if (ref) {
+        const row = this.#db.prepare('SELECT record FROM artifacts WHERE id = ? AND run_id = ?').get(ref, run.id);
+        if (!row || !this.#validArtifact(decode(row, ArtifactRefSchema))) fail('INVALID_EVIDENCE', 'Run artifact is missing or changed');
+      }
+      if (update.data.phase === 'READY_FOR_REVIEW') {
+        if (run.pendingActionIds.length || this.#db.prepare("SELECT 1 FROM actions WHERE run_id = ? AND state != 'OBSERVED'").get(run.id)) fail('RECOVERY_REQUIRED', 'Pending execution prevents readiness');
+        if (!(update.data.baselineRef ?? run.baselineRef) || !(update.data.candidateRef ?? run.candidateRef)) fail('INVALID_EVIDENCE', 'Baseline and candidate evidence required');
+      }
+      Object.assign(run, update.data); this.#save(run); this.#event(run.id, 'RUN_PROGRESS', { phase: run.phase }); return run;
+    });
+  }
+  /** Publish a terminal state and relinquish ownership in one transaction. */
+  finalizeRun(owner:OwnerToken,input:Parameters<RunStore['updateRunState']>[1]):Result<RunRecord>{
+    return this.#atomic(()=>{
+      const updated=this.updateRunState(owner,input);if(!updated.ok)fail(updated.error.code,updated.error.message);
+      const released=this.release(owner);if(!released.ok)fail(released.error.code,released.error.message);
+      return updated.value;
+    });
+  }
   loadAction(id: string): Result<ActionRecord> { return this.#atomic(() => { const row = this.#db.prepare('SELECT record FROM actions WHERE id = ?').get(id); if (!row) fail('ACTION_NOT_FOUND', 'Action does not exist'); return decode(row, ActionRecordSchema); }); }
   loadArtifact(id: string): Result<ArtifactRef> { return this.#atomic(() => { const row = this.#db.prepare('SELECT record FROM artifacts WHERE id = ?').get(id); if (!row) fail('ARTIFACT_NOT_FOUND', 'Artifact does not exist'); return decode(row, ArtifactRefSchema); }); }
   listArtifacts(runId: string): ArtifactRef[] { return this.#db.prepare('SELECT record FROM artifacts WHERE run_id = ? ORDER BY rowid').all(runId).map(row => decode(row, ArtifactRefSchema)); }
   listEvents(runId: string): Result<StoreEvent[]> { return this.#atomic(() => { this.#run(runId); return this.#db.prepare('SELECT record FROM events WHERE run_id = ? ORDER BY sequence').all(runId).map(row => JSON.parse((row as { record: string }).record) as StoreEvent); }); }
-  appendQualification(owner: OwnerToken, input: QualificationEnvelope, expectedRecordCount: number): Result<void> {
+  appendQualification(owner: OwnerToken, input: QualificationEnvelope, expectedRecordCount: number, expectedGlobalRecordCount?: number, pendingDispatchPayload?: ActionIntent['payload']): Result<void> {
     let envelope: QualificationEnvelope;
     try {
       envelope = QualificationEnvelopeSchema.parse(input);
       if (Buffer.byteLength(JSON.stringify(envelope)) > 1048576) return storeError('INVALID_CONTRACT', 'Qualification envelope exceeds the frame bound');
     } catch { return storeError('INVALID_CONTRACT', 'Qualification envelope is malformed'); }
     if (!Number.isSafeInteger(expectedRecordCount) || expectedRecordCount < 0) return storeError('INVALID_CONTRACT', 'Qualification revision is invalid');
+    if (expectedGlobalRecordCount !== undefined && (!Number.isSafeInteger(expectedGlobalRecordCount) || expectedGlobalRecordCount < 0)) return storeError('INVALID_CONTRACT', 'Global qualification revision is invalid');
     return this.#atomic(() => {
-      this.#fence(owner); this.#action(envelope.actionId, owner);
+      this.#fence(owner); const action = this.#action(envelope.actionId, owner);
+      if (pendingDispatchPayload !== undefined && (envelope.kind !== 'CAMPAIGN_DISPATCH' || action.kind !== 'PENDING_EXECUTION' || action.state !== 'INTENDED' || JSON.stringify(action.payload) !== JSON.stringify(pendingDispatchPayload))) fail('PENDING_DISPATCH_CONFLICT', 'Exact undispatched pending intent is required for atomic campaign adoption');
       if (envelope.runId !== owner.runId || envelope.generation !== owner.generation) fail('STALE_OWNER', 'Qualification record belongs to another owner generation');
       if (this.#db.prepare('SELECT 1 FROM qualifications WHERE id = ?').get(envelope.id)) fail('DUPLICATE_QUALIFICATION', 'Qualification records are immutable');
       const count = this.#db.prepare('SELECT count(*) AS count FROM qualifications WHERE run_id = ?').get(owner.runId) as { count: number };
       if (count.count !== expectedRecordCount) fail('QUALIFICATION_CONFLICT', 'Qualification history changed; no record was appended');
+      if (expectedGlobalRecordCount !== undefined) {
+        const global = this.#db.prepare('SELECT count(*) AS count FROM qualifications').get() as { count: number };
+        if (global.count !== expectedGlobalRecordCount) fail('QUALIFICATION_CONFLICT', 'Global qualification lineage changed; no record was appended');
+      }
       this.#db.prepare('INSERT INTO qualifications(id, run_id, record) VALUES (?, ?, ?)').run(envelope.id, owner.runId, JSON.stringify(envelope));
+      if (pendingDispatchPayload !== undefined) {
+        action.state = 'DISPATCHED'; this.#saveAction(action);
+        this.#event(owner.runId, 'ACTION_DISPATCHED', { actionId: action.id });
+      }
     });
   }
   listQualifications(runId?: string): Result<QualificationEnvelope[]> {
@@ -128,7 +165,36 @@ export class RunStore {
       return action;
     });
   }
+  cancelUndispatched(owner: OwnerToken, id: string): Result<ActionRecord> {
+    return this.#atomic(() => {
+      const run = this.#fence(owner); const action = this.#action(id, owner);
+      if (action.state !== 'INTENDED') fail('INVALID_ACTION_TRANSITION', 'Only an undispatched intended action may be cancelled');
+      action.state = 'OBSERVED'; action.outcome = { schemaVersion: 1, status: 'CANCELLED', evidenceIds: [] };
+      this.#saveAction(action); run.pendingActionIds = run.pendingActionIds.filter(value => value !== id); this.#save(run);
+      this.#event(run.id, 'ACTION_CANCELLED_UNDISPATCHED', { actionId: id });
+      this.#event(run.id, 'ACTION_OBSERVED', { actionId: id, status: 'CANCELLED' }); return action;
+    });
+  }
   outcome(owner: OwnerToken, id: string, input: ActionOutcome): Result<void> { const parsed = parseContract(ActionOutcomeSchema, input); if (!parsed.ok) return parsed; return this.#atomic(() => { const run = this.#fence(owner); const action = this.#action(id, owner); if (action.state === 'OBSERVED') fail('INVALID_ACTION_TRANSITION', 'Observed actions are immutable'); if ((action.state === 'INTENDED' || action.state === 'OUTCOME_UNKNOWN') && input.status !== 'RECONCILED') fail('INVALID_ACTION_TRANSITION', 'Undispatched or unknown action requires explicit reconciliation'); for (const evidenceId of input.evidenceIds) { const row = this.#db.prepare('SELECT run_id FROM artifacts WHERE id = ?').get(evidenceId) as { run_id: string } | undefined; if (!row || row.run_id !== run.id) fail('INVALID_EVIDENCE', 'Outcome evidence must reference this run'); } action.state = 'OBSERVED'; action.outcome = parsed.value; this.#saveAction(action); run.pendingActionIds = run.pendingActionIds.filter(value => value !== id); this.#save(run); this.#event(run.id, 'ACTION_OBSERVED', { actionId: id, status: input.status }); }); }
+  /** Retain measured process time once per kernel identity, including failed actions. */
+  recordProcessUsage(owner: OwnerToken, actionId: string, input: {kind:'root'|'helper';identity:{pid:number;creationIdentity:string};activeMs:number}): Result<{activeMs:number;limit:boolean}> {
+    const parsed=z.strictObject({kind:z.enum(['root','helper']),identity:z.strictObject({pid:z.number().int().positive(),creationIdentity:z.string().min(1).max(256)}),activeMs:z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)}).safeParse(input);
+    if(!parsed.success)return storeError('INVALID_CONTRACT','Invalid process usage');
+    return this.#atomic(()=>{
+      const run=this.#fence(owner);const action=this.#action(actionId,owner);
+      if(action.state==='INTENDED')fail('INVALID_ACTION_TRANSITION','Usage requires a dispatched action');
+      const meter=parsed.data;const identity=JSON.stringify({actionId,kind:meter.kind,...meter.identity});
+      const prior=this.#db.prepare("SELECT record FROM events WHERE run_id = ? AND kind = 'PROCESS_USAGE'").all(run.id) as {record:string}[];
+      const existing=prior.map(row=>JSON.parse(row.record) as StoreEvent).find(event=>event.payload.identity===identity);
+      if(existing&&existing.payload.activeMs!==meter.activeMs)fail('USAGE_CONFLICT','Process usage changed after recording');
+      if(!existing){
+        if(!Number.isSafeInteger(run.cumulativeBudgets.activeMs+meter.activeMs))fail('USAGE_COUNT_EXHAUSTED','Process usage counter exhausted');
+        run.cumulativeBudgets.activeMs+=meter.activeMs;this.#save(run);this.#event(run.id,'PROCESS_USAGE',{actionId,identity,activeMs:meter.activeMs});
+      }
+      const row=this.#db.prepare('SELECT limits FROM runs WHERE id = ?').get(run.id) as {limits:string};
+      return {activeMs:run.cumulativeBudgets.activeMs,limit:run.cumulativeBudgets.activeMs>=LimitsSchema.parse(JSON.parse(row.limits)).activeMs};
+    });
+  }
   reserveOutput(owner: OwnerToken, actionId: string | null, rawBytes: number): Result<{ acceptedBytes: number; limit: ArtifactRef['limit']; diagnosticBytes: number }> { return this.#atomic(() => { const run = this.#fence(owner); if (!Number.isSafeInteger(rawBytes) || rawBytes < 0) fail('INVALID_CONTRACT', 'Raw byte count is invalid'); const row = this.#db.prepare('SELECT limits FROM runs WHERE id = ?').get(run.id) as { limits: string }; const limits = LimitsSchema.parse(JSON.parse(row.limits)); const action = actionId === null ? null : this.#action(actionId, owner); const runRemaining = Math.max(0, limits.maxRunOutputBytes - run.cumulativeBudgets.outputBytes); const actionRemaining = action ? Math.max(0, limits.maxActionOutputBytes - action.rawBytes) : Infinity; const acceptedBytes = Math.min(rawBytes, runRemaining, actionRemaining); const limit = rawBytes === 0 ? null : rawBytes >= Math.min(runRemaining, actionRemaining) ? (actionRemaining < runRemaining ? 'ACTION_OUTPUT_LIMIT' : 'RUN_OUTPUT_LIMIT') : null; if (!Number.isSafeInteger(run.cumulativeBudgets.outputBytes + rawBytes) || (action && !Number.isSafeInteger(action.rawBytes + rawBytes))) fail('OUTPUT_COUNT_EXHAUSTED', 'Raw output count exhausted'); run.cumulativeBudgets.outputBytes += rawBytes; this.#save(run); if (action) { action.rawBytes += rawBytes; this.#saveAction(action); } if (limit) this.#event(run.id, 'OUTPUT_LIMIT', { actionId, limit, rawBytes, acceptedBytes, runRawBytes: run.cumulativeBudgets.outputBytes, actionRawBytes: action?.rawBytes ?? null, producerStopRequired: true }); return { acceptedBytes, limit, diagnosticBytes: limits.maxDiagnosticBytes }; }); }
   registerArtifact(owner: OwnerToken, artifact: ArtifactRef): Result<ArtifactRef> { const parsed = parseContract(ArtifactRefSchema, artifact); if (!parsed.ok) return parsed; return this.#atomic(() => { this.#fence(owner); if (artifact.runId !== owner.runId) fail('STALE_OWNER', 'Artifact is outside owned run'); if (artifact.actionId) this.#action(artifact.actionId, owner); if (this.#db.prepare('SELECT 1 FROM artifacts WHERE id = ?').get(artifact.id)) fail('DUPLICATE_ARTIFACT', 'Artifact ID already exists'); if (!this.#validArtifact(artifact)) fail('INVALID_ARTIFACT', 'Published artifact hash or size does not match'); this.#db.prepare('INSERT INTO artifacts VALUES (?, ?, ?, ?, ?)').run(artifact.id, owner.runId, artifact.actionId, artifact.sha256, JSON.stringify(parsed.value)); this.#event(owner.runId, 'ARTIFACT_REFERENCED', { artifactId: artifact.id }); return parsed.value; }); }
   #validArtifact(artifact: ArtifactRef): boolean { try { const bytes = readFileSync(join(this.root, 'artifacts', artifact.sha256)); return bytes.length === artifact.storedBytes && createHash('sha256').update(bytes).digest('hex') === artifact.sha256; } catch { return false; } }

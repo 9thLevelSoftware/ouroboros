@@ -1,14 +1,21 @@
 mod protocol;
 #[cfg(windows)] mod windows;
+#[cfg(windows)] mod qualification_observer;
 #[cfg(target_os="linux")] mod linux;
 #[cfg(windows)]
 fn main() {
-    if let Err(error)=run() {eprintln!("supervisor: {error}");std::process::exit(1);}
+    let args=std::env::args().skip(1).collect::<Vec<_>>();
+    let result=if args.first().is_some_and(|a|a=="--qualification-observer-v1") {qualification_observer::run(&args)}else{run()};
+    if let Err(error)=result {eprintln!("supervisor: {error}");std::process::exit(1);}
 }
 #[cfg(target_os="linux")] fn main(){if let Err(error)=linux::run(){eprintln!("supervisor: {error}");std::process::exit(1);}}
 #[cfg(not(any(windows,target_os="linux")))] fn main(){eprintln!("unsupported supervisor environment");std::process::exit(1);}
 #[cfg(windows)]
 fn now_ms()->u64 {std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64}
+// Qualification reservations include this bounded terminal observation tail
+// for both integral helper/root lifetimes; keep the TypeScript envelope aligned.
+#[cfg(windows)]
+const SUPERVISOR_DRAIN_TAIL_MS:u64=15_000;
 #[cfg(windows)]
 fn envelope(owner:&protocol::Owner,kind:&str,extra:serde_json::Value)->serde_json::Value {
     let mut value=serde_json::to_value(owner).unwrap();value.as_object_mut().unwrap().insert("protocolVersion".into(),1.into());value.as_object_mut().unwrap().insert("type".into(),kind.into());value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());value
@@ -26,20 +33,29 @@ fn run()->Result<(),Box<dyn std::error::Error>> {
     let spec=initial.spec.as_ref().ok_or("launch spec missing")?;spec.validate()?;let owner=spec.owner();if owner!=initial.owner(){return Err("launch owner identity mismatch".into());}
     let remaining=spec.deadline.checked_sub(now_ms()).filter(|n|*n>0).ok_or("deadline expired")?;
     let deadline=Instant::now().checked_add(Duration::from_millis(remaining)).ok_or("deadline outside monotonic clock range")?;let mut lease=Instant::now()+Duration::from_millis(spec.lease_ttl_ms);
+    spec.ensure_launch_current(now_ms())?;
     let job=windows::Job::new()?;let mut child=job.launch(spec)?;
+    // Opt-in handoff must finish before ResumeThread. Failed handoff drops the
+    // still-suspended child; only this helper ever owns its inner Job handle.
+    let mut observation=qualification_observer::helper_handoff(&mut child,&owner,&spec.boundary_hash)?;
     let fault=Arc::new(AtomicBool::new(false));let total=Arc::new(AtomicU64::new(0));
     // Bounded writer decouples lease enforcement from a controller that stops reading stdout.
     let (output_tx,output_rx)=mpsc::sync_channel::<serde_json::Value>(128);let (flushed_tx,flushed_rx)=mpsc::channel();let writer_fault=fault.clone();
     std::thread::spawn(move || {let mut output=std::io::stdout().lock();for msg in output_rx {let bytes=serde_json::to_vec(&msg).unwrap();if bytes.len()>protocol::MAX_FRAME || output.write_all(&(bytes.len() as u32).to_le_bytes()).and_then(|_|output.write_all(&bytes)).and_then(|_|output.flush()).is_err() {writer_fault.store(true,Ordering::Release);break;}if msg["type"]=="drained" {let _=flushed_tx.send(());}}});
     let receipt=json!({"schemaVersion":1,"runId":owner.run_id,"generation":owner.generation,"actionId":owner.action_id,"role":owner.role,"environment":"windows","pid":child.pid,"creationIdentity":child.creation,"helperPid":std::process::id(),"helperCreationIdentity":windows::helper_creation_identity()?,"jobIdentity":format!("job:{}:{}",std::process::id(),child.creation),"boundaryHash":spec.boundary_hash,"assignedBeforeResume":true,"capturedAt":now_ms()});
     output_tx.try_send(envelope(&owner,"launched",json!({"receipt":receipt})))?;
+    // Handle transfer and receipt setup can outlive the original admission.
+    // Leave an expired child suspended; dropping its sole Job owner kills it.
+    if Instant::now()>=deadline || Instant::now()>=lease {return Err("deadline or lease expired before resume".into());}
+    spec.ensure_launch_current(now_ms())?;
     child.resume()?;
     // The gate serializes bounded try_send acceptance with terminal closure. No
     // blocking pipe read/write or queue wait is performed while holding it.
     struct OutputGate {closed:bool,completed:BTreeMap<&'static str,bool>}
     let output_gate=Arc::new(Mutex::new(OutputGate {closed:false,completed:BTreeMap::new()}));
     let (reader_done_tx,reader_done_rx)=mpsc::sync_channel(2);let mut output_readers=Vec::new();
-    for (stream,mut pipe) in [("stdout",child.stdout.take().unwrap()),("stderr",child.stderr.take().unwrap())] {
+    let local_pipes=if observation.is_some(){Vec::new()}else{vec![("stdout",child.stdout.take().unwrap()),("stderr",child.stderr.take().unwrap())]};
+    for (stream,mut pipe) in local_pipes {
         let tx=output_tx.clone();let fault=fault.clone();let total=total.clone();let owner=owner.clone();
         let gate=output_gate.clone();let done=reader_done_tx.clone();
         output_readers.push(std::thread::spawn(move || {
@@ -55,10 +71,22 @@ fn run()->Result<(),Box<dyn std::error::Error>> {
             gate.lock().unwrap().completed.insert(stream,complete);let _=done.try_send(());
         }));
     }
+    if let Some(remote)=observation.as_mut(){
+        let mut pipe=remote.reader.take().ok_or("handoff reader absent")?;let tx=output_tx.clone();let fault=fault.clone();let total=total.clone();let gate=output_gate.clone();let done=reader_done_tx.clone();let owner=owner.clone();
+        output_readers.push(std::thread::spawn(move||{
+            loop{match qualification_observer::read_value(&mut pipe){
+                Ok(Some(msg)) if msg["type"]=="output"=>{let stream=match msg["stream"].as_str(){Some("stdout")=>"stdout",Some("stderr")=>"stderr",_=>{fault.store(true,Ordering::Release);break;}};let bytes=match msg["data"].as_str().and_then(protocol::decode_base64){Some(v)=>v,None=>{fault.store(true,Ordering::Release);break;}};let gate=gate.lock().unwrap();if gate.closed{break;}if total.fetch_add(bytes.len() as u64,Ordering::Relaxed)+bytes.len() as u64>10*1024*1024||tx.try_send(envelope(&owner,"output",json!({"stream":stream,"data":protocol::base64(&bytes)}))).is_err(){fault.store(true,Ordering::Release);break;}},
+                Ok(Some(msg)) if msg["type"]=="outputEof"=>{let stream=match msg["stream"].as_str(){Some("stdout")=>"stdout",Some("stderr")=>"stderr",_=>{fault.store(true,Ordering::Release);break;}};let mut gate=gate.lock().unwrap();gate.completed.insert(stream,true);let finished=gate.completed.len()==2;drop(gate);let _=done.try_send(());if finished{break;}},
+                _=>{fault.store(true,Ordering::Release);break;}
+            }}
+        }));
+    }
     drop(reader_done_tx);
     let mut input_tx=child.stdin.take().map(|mut pipe| {let(tx,rx)=mpsc::sync_channel::<Option<Vec<u8>>>(16);let fault=fault.clone();std::thread::spawn(move || {for bytes in rx {match bytes {Some(bytes)=>if pipe.write_all(&bytes).is_err(){fault.store(true,Ordering::Release);break;},None=>break}}});tx});
     let mut fenced=false;let mut sequence=0;let mut lease_sequence=0;let mut acknowledged=false;
+    let mut next_members=Instant::now();
     let reason=loop {
+        if Instant::now()>=next_members {if let Some(remote)=observation.as_mut(){let _=remote.publish_members(&job,&child);}next_members=Instant::now()+Duration::from_millis(100);}
         if fault.load(Ordering::Acquire){break "io_or_output_limit".to_string();}
         if Instant::now()>=deadline {break "deadline_expired".to_string();}
         if Instant::now()>=lease {break "lease_expired".to_string();}
@@ -90,9 +118,13 @@ fn run()->Result<(),Box<dyn std::error::Error>> {
     };
     // Fencing precedes termination. Generic subprocesses have no safe universal graceful
     // signal; provider adapters perform their supported grace before requesting this drain.
-    input_tx.take();let requested=now_ms();let evidence_deadline=Instant::now()+Duration::from_secs(15);let ack_at=if acknowledged {Some(requested)}else{None};
+    input_tx.take();let requested=now_ms();let evidence_deadline=Instant::now()+Duration::from_millis(SUPERVISOR_DRAIN_TAIL_MS);let ack_at=if acknowledged {Some(requested)}else{None};
     if acknowledged {let _=output_tx.try_send(envelope(&owner,"ack",json!({"sequence":sequence,"operation":"drain"})));}
+    if let Some(remote)=observation.as_mut(){let _=remote.termination(&reason,child.exited().unwrap_or(false));}
     let _=job.terminate();let (root_exited,active,members)=windows::observe_drain(&job,&child,evidence_deadline);let observed=now_ms();
+    // Query only the retained launch handle after observed exit. A query failure
+    // stays unknown and must never become a fabricated successful child status.
+    let root_exit_code=if root_exited {child.exit_code().ok().flatten()}else{None};
     // Finish accepted output before the terminal frame, bounded by the same
     // process-evidence deadline. Missing/error/aborted readers stay unresolved.
     while output_gate.lock().unwrap().completed.len()<2 {
@@ -103,7 +135,7 @@ fn run()->Result<(),Box<dyn std::error::Error>> {
     // Completion signals, rather than an unbounded join, establish queue
     // finalization. Timed-out readers cannot enqueue after the closed gate.
     drop(output_readers);
-    let evidence=json!({"schemaVersion":1,"runId":owner.run_id,"generation":owner.generation,"actionId":owner.action_id,"role":owner.role,"reason":reason,"requestAcknowledged":acknowledged,"requestedAt":requested,"acknowledgedAt":ack_at,"rootExited":root_exited,"rootExitedAt":if root_exited {Some(observed)}else{None},"membershipEmpty":active==0,"membershipObservedAt":observed,"activeProcesses":active,"unresolvedExecutions":members,"outputComplete":output_complete,"unresolvedOutputStreams":unresolved_output,"outputCompletedAt":if output_complete {Some(output_observed)}else{None},"childRanBeforeAssignment":false,"completedAt":output_observed});
+    let evidence=json!({"schemaVersion":1,"runId":owner.run_id,"generation":owner.generation,"actionId":owner.action_id,"role":owner.role,"reason":reason,"requestAcknowledged":acknowledged,"requestedAt":requested,"acknowledgedAt":ack_at,"rootExited":root_exited,"rootExitedAt":if root_exited {Some(observed)}else{None},"rootExitCode":root_exit_code,"membershipEmpty":active==0,"membershipObservedAt":observed,"activeProcesses":active,"unresolvedExecutions":members,"outputComplete":output_complete,"unresolvedOutputStreams":unresolved_output,"outputCompletedAt":if output_complete {Some(output_observed)}else{None},"childRanBeforeAssignment":false,"completedAt":output_observed});
     let mut terminal=envelope(&owner,"drained",json!({"evidence":evidence}));
     let queued=loop {match output_tx.try_send(terminal) {
         Ok(())=>break true,

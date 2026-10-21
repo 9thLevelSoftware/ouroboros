@@ -8,6 +8,7 @@ import { OwnershipReceiptSchema, WindowsDrainEvidenceSchema } from '../contracts
 import { RuntimeCapabilitiesSchema, type RuntimeCapabilities } from '../contracts/provider.ts';
 import { storeError, type RunStore, type QualificationEnvelope } from '../store/database.ts';
 import { REQUIRED_CODEX_WINDOWS_PROBES, fingerprint } from './probes.ts';
+import { evaluateStartupBlockers, evaluateStartupSupportingRequirements, loadStartupEvidence, type StartupEvidenceOptions } from './startup-evidence.ts';
 
 const Identity = z.strictObject({ version: TextSchema, sha256: HashSchema });
 const Binary = Identity.extend({ path: PathSchema });
@@ -52,7 +53,7 @@ export const QualificationReportSchema = z.strictObject({ schemaVersion: z.liter
  probes: z.array(z.strictObject({ id: TextSchema, status: z.enum(['PASS', 'FAIL', 'UNTESTED']), evidenceKind: z.enum(['live', 'fixture', 'fault_injection']).nullable(), attemptIds: z.array(IdSchema), evidenceIds: z.array(IdSchema) })) });
 export type QualificationReport = z.infer<typeof QualificationReportSchema>;
 type History = { target: QualificationTarget; request: QualificationRequest; attempts: ProbeAttempt[]; revision: number };
-type LedgerOptions = { authorizeCurrent(request: Readonly<QualificationRequest>, probeId: string, launchHash: string): boolean };
+type LedgerOptions = { authorizeCurrent(request: Readonly<QualificationRequest>, probeId: string, launchHash: string): boolean; startupEvidence?: StartupEvidenceOptions };
 function frozen<T>(value: T): T { if (value && typeof value === 'object') { for (const child of Object.values(value)) frozen(child); Object.freeze(value); } return value; }
 function json(value: unknown): z.infer<ReturnType<typeof z.json>> { return JSON.parse(JSON.stringify(value)); }
 
@@ -189,8 +190,10 @@ export class QualificationLedger {
    drain.unresolvedExecutions.length === 0 && drain.outputComplete && drain.unresolvedOutputStreams.length === 0 && drain.outputCompletedAt !== null &&
    !!heartbeat && heartbeat.beforeBytes > 0 && heartbeat.beforeBytes === heartbeat.afterBytes && heartbeat.stableMs >= 2000 && observation.unrelatedProcessAlive === true;
  }
- report(requestId: string, blockers: string[]): Result<QualificationReport> {
+ report(requestId: string, additionalBlockers: string[] = []): Result<QualificationReport> {
   const history = this.history(requestId); if (!history.ok) return history; const { target, request, attempts } = history.value;
+  const evidence=loadStartupEvidence(this.store,target,this.options.startupEvidence);
+  const blockers=[...new Set([...additionalBlockers,...evaluateStartupBlockers(target,evidence).filter(item=>item.state==='OPEN').map(item=>item.id),...evaluateStartupSupportingRequirements(target,evidence).filter(item=>item.state==='OPEN').map(item=>`STARTUP_SUPPORTING_${item.id.toUpperCase().replaceAll('-','_')}_UNPROVEN`)])];
   const report: QualificationReport = { schemaVersion: 1, id: randomUUID(), requestId, target, targetHash: request.targetHash, blockers, createdAt: Date.now(), qualified: false,
    probes: REQUIRED_CODEX_WINDOWS_PROBES.map(definition => { const prior = attempts.filter(a => a.probeId === definition.id); const observation = prior.at(-1)?.observation;
     return { id: definition.id, status: observation?.status ?? 'UNTESTED', evidenceKind: observation?.evidenceKind ?? null, attemptIds: prior.map(a => a.id), evidenceIds: observation?.evidence.map(e => e.id) ?? [] }; }) };
@@ -208,6 +211,8 @@ export class QualificationLedger {
    const matching = reports.filter(r => r.targetHash === targetHash).at(-1);
    if (!matching) return storeError(reports.length ? 'NEEDS_REVALIDATION' : 'UNQUALIFIED', 'No receipt matches the complete runtime/helper/wrapper/policy/platform/model target');
    const history = this.history(matching.requestId); if (!history.ok) return history;
+   const startup=loadStartupEvidence(this.store,parsed.data,this.options.startupEvidence);
+   if(evaluateStartupBlockers(parsed.data,startup).some(item=>item.state==='OPEN')||evaluateStartupSupportingRequirements(parsed.data,startup).some(item=>item.state==='OPEN'))return storeError('UNQUALIFIED','Current accepted startup and supporting evidence required');
    const recovery = this.store.reconcileEvidence(history.value.request.owner.runId); if (!recovery.ok) return recovery;
    if (!matching.qualified || matching.blockers.length || !recovery.value.allowsReady || matching.probes.length !== REQUIRED_CODEX_WINDOWS_PROBES.length ||
     REQUIRED_CODEX_WINDOWS_PROBES.some(definition => { const probe = matching.probes.find(p => p.id === definition.id); const latest = history.value.attempts.filter(a => a.probeId === definition.id).at(-1);

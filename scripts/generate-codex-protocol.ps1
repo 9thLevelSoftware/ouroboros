@@ -5,16 +5,23 @@ param(
   [switch]$ResumeFailedImport
 )
 $ErrorActionPreference = 'Stop'
-$pin = 'dd13bdb162a184fa04039488b234a8258ef9b76f84e926c505d5742b19249a6a'
-if (-not [IO.Path]::IsPathFullyQualified($CodexExecutable) -or (Get-FileHash -LiteralPath $CodexExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pin) { throw 'Pinned absolute Codex 0.162.1 executable required' }
-if (-not [IO.Path]::IsPathFullyQualified($OutputRoot) -or ((Test-Path -LiteralPath $OutputRoot) -and -not ($PreparedRoot -and $ResumeFailedImport))) { throw 'Fresh absolute output root required (or explicitly resume verified prepared import)' }
+if (-not [IO.Path]::IsPathFullyQualified($CodexExecutable) -or -not (Test-Path -LiteralPath $CodexExecutable -PathType Leaf)) { throw 'Absolute existing Codex executable required' }
+$pin = (Get-FileHash -LiteralPath $CodexExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
+$versionOutput = & $CodexExecutable --version
+if ($LASTEXITCODE -ne 0 -or ($versionOutput -join "`n") -notmatch '^codex-cli ([0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?)$') { throw 'Unrecognized Codex version response' }
+$runtimeVersion = $Matches[1]
+if (-not [IO.Path]::IsPathFullyQualified($OutputRoot)) { throw 'Absolute output root required' }
+$OutputRoot = Join-Path $OutputRoot ($runtimeVersion + '-' + $pin)
+if ((Test-Path -LiteralPath $OutputRoot) -and -not ($PreparedRoot -and $ResumeFailedImport)) { throw 'Fresh runtime-specific output root required (or explicitly resume verified prepared import)' }
 if ($PreparedRoot) {
-  $rawTs = Join-Path $PreparedRoot 'typescript-0.162.1'
-  $rawJson = Join-Path $PreparedRoot 'json-schema-0.162.1'
+  $rawTs = Join-Path $PreparedRoot ('typescript-' + $runtimeVersion)
+  $rawJson = Join-Path $PreparedRoot ('json-schema-' + $runtimeVersion)
   $preparedManifestPath = Join-Path ([IO.Path]::GetDirectoryName($PreparedRoot.TrimEnd('\','/'))) 'task-5-generated-manifest.json'
   $preparedManifest = Get-Content -LiteralPath $preparedManifestPath -Raw | ConvertFrom-Json
+  if ($preparedManifest.runtimeVersion -ne $runtimeVersion -or $preparedManifest.binarySha256 -ne $pin) { throw 'Prepared manifest runtime identity mismatch' }
+  if (@($preparedManifest.roots).Count -ne 2) { throw 'Prepared manifest must contain exactly two roots' }
   foreach ($root in $preparedManifest.roots) {
-    $preparedSource = if ($root.root.EndsWith('typescript-0.162.1')) { $rawTs } else { $rawJson }
+    $preparedSource = if ($root.root.EndsWith(('typescript-' + $runtimeVersion))) { $rawTs } elseif ($root.root.EndsWith(('json-schema-' + $runtimeVersion))) { $rawJson } else { throw 'Unexpected prepared root' }
     if ([IO.Directory]::GetFiles($preparedSource,'*',[IO.SearchOption]::AllDirectories).Length -ne $root.fileCount) { throw 'Prepared file count mismatch' }
     foreach ($entry in $root.files) {
       $preparedFile = Join-Path $preparedSource $entry.path
@@ -26,8 +33,8 @@ if ($PreparedRoot) {
   $stage = Join-Path ([IO.Path]::GetTempPath()) ('ouroboros-codegen-' + [Guid]::NewGuid())
   $isolatedHome = Join-Path $stage 'isolated-codex-home'
   New-Item -ItemType Directory -Path $isolatedHome | Out-Null
-  $rawTs = Join-Path $stage 'typescript-0.162.1'
-  $rawJson = Join-Path $stage 'json-schema-0.162.1'
+  $rawTs = Join-Path $stage ('typescript-' + $runtimeVersion)
+  $rawJson = Join-Path $stage ('json-schema-' + $runtimeVersion)
   $previousHome = [Environment]::GetEnvironmentVariable('CODEX_HOME', 'Process')
   try {
     [Environment]::SetEnvironmentVariable('CODEX_HOME', $isolatedHome, 'Process')
@@ -38,6 +45,7 @@ if ($PreparedRoot) {
     if ($LASTEXITCODE -ne 0) { throw 'JSON schema generation failed' }
   } finally { [Environment]::SetEnvironmentVariable('CODEX_HOME', $previousHome, 'Process') }
 }
+if ((Get-FileHash -LiteralPath $CodexExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pin) { throw 'Codex executable changed during generation' }
 $encoding = [Text.UTF8Encoding]::new($false, $true)
 $rows = [Collections.Generic.List[object]]::new()
 foreach ($group in @(@{source=$rawTs;dest='typescript'},@{source=$rawJson;dest='json-schema'})) {
@@ -70,5 +78,5 @@ foreach ($group in @(@{source=$rawTs;dest='typescript'},@{source=$rawJson;dest='
     $rows.Add(@{path=($group.dest+'/'+$relative);rawBytes=$original.Length;rawSha256=[Convert]::ToHexStringLower([Security.Cryptography.SHA256]::HashData($original));bytes=$bytes.Length;sha256=[Convert]::ToHexStringLower([Security.Cryptography.SHA256]::HashData($bytes))})
   }
 }
-$manifest = @{schemaVersion=1;runtimeVersion='0.162.1';binarySha256=$pin;transform='relative-type-specifier-js-v1; verify target .ts; exact root namespace export ./v2 becomes ./v2/index.js after target check; no other changes';rawTypeScriptRoot=$rawTs;rawJsonRoot=$rawJson;files=$rows.ToArray()}
+$manifest = @{schemaVersion=1;runtimeVersion=$runtimeVersion;binarySha256=$pin;transform='relative-type-specifier-js-v1; verify target .ts; exact root namespace export ./v2 becomes ./v2/index.js after target check; no other changes';rawTypeScriptRoot=$rawTs;rawJsonRoot=$rawJson;files=$rows.ToArray()}
 [IO.File]::WriteAllText((Join-Path $OutputRoot 'provenance.json'), ($manifest | ConvertTo-Json -Depth 6),$encoding)

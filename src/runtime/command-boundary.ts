@@ -34,8 +34,7 @@ export function compileCommandBoundary(input: CommandDefinition, profileInput: B
   const policy = PolicySchema.parse(Object.fromEntries(Object.keys(PolicySchema.shape).map(key => [key, profile[key as keyof BoundaryProfile]])));
   if (qualification.environment !== profile.platform || qualification.runtimeVersion !== profile.verifier.version ||
       qualification.runtimeHash !== profile.verifier.sha256 || qualification.policyHash !== hash(policy) ||
-      !qualification.inheritedDescriptorsRestricted || (profile.platform === 'wsl2' && !qualification.seccompUnixSockets) ||
-      (profile.platform === 'wsl2' ? profile.verifier.version !== '0.0.79' : profile.verifier.version !== '0.162.1')) return fail('Exact verifier runtime/policy qualification is stale or unavailable');
+      !qualification.inheritedDescriptorsRestricted || (profile.platform === 'wsl2' && !qualification.seccompUnixSockets)) return fail('Exact verifier runtime/policy qualification is stale or unavailable');
   const registered = profile.registry.filter(entry => entry.id === command.id);
   if (registered.length !== 1 || hash(registered[0]) !== hash(command)) return fail('Command is not the unchanged fixed registry definition');
   const paths = profile.platform === 'windows' ? win32 : posix;

@@ -73,10 +73,11 @@ export class FrameDecoder {
 }
 export type SupervisorOptions = {
   helperPath: string;
-  /** Trusted controller lookup: bind current receipt/probe approval to the entire spec.
+  /** Trusted controller lookup: bind explicit user-task authority or current receipt/probe approval to the entire spec.
    * Task 7 supplies qualification ledger lookup, freshness and resolved fixture-scope checks.
    * A reference or declared fixtureRoots alone never grants permission. */
   authorize: (spec: Readonly<LaunchSpec>) => Promise<boolean>;
+  observation?: SupervisorRawMeter;
 };
 function failure<T>(code: string, message: string): Result<T> { return { ok: false, error: { code, message, evidenceIds: [] } }; }
 type Pending = { operation: string; resolve: (value: SupervisorFrame) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
@@ -95,19 +96,31 @@ export function createSupervisor(options: SupervisorOptions): Supervisor {
           new Set(Object.keys(spec.env).map(key => key.toUpperCase())).size !== Object.keys(spec.env).length || spec.deadline <= Date.now()) {
         return failure('INVALID_LAUNCH_SPEC', 'Absolute paths, unique environment keys and future deadline required');
       }
+      if (spec.launchNotAfter !== undefined && spec.launchNotAfter <= Date.now()) {
+        return failure('LAUNCH_WINDOW_EXPIRED', 'Launch admission cutoff expired');
+      }
       // Resolver receives a deep-frozen snapshot; the worker has no default permission path.
       Object.freeze(spec.argv); Object.freeze(spec.env);
       if (spec.authorization.kind === 'qualification') Object.freeze(spec.authorization.fixtureRoots);
       Object.freeze(spec.authorization); Object.freeze(spec);
       try { if (!(await options.authorize(spec))) return failure('EXECUTION_NOT_AUTHORIZED', 'Execution authorization lookup denied launch'); }
       catch { return failure('EXECUTION_NOT_AUTHORIZED', 'Execution authorization lookup failed'); }
+      if (spec.launchNotAfter !== undefined && spec.launchNotAfter <= Date.now()) {
+        return failure('LAUNCH_WINDOW_EXPIRED', 'Launch admission cutoff expired during authorization');
+      }
       if (process.platform !== 'win32') return failure('UNSUPPORTED_ENVIRONMENT', 'Native supervisor requires Windows');
       if (spec.deadline <= Date.now()) return failure('DEADLINE_EXPIRED', 'Deadline expired during authorization');
-      return await connectOwnedHelper({ file: options.helperPath, args: [] }, spec, 'windows');
+      return await connectOwnedHelper({ file: options.helperPath, args: [] }, spec, 'windows', options.observation);
     },
   };
 }
-export async function connectOwnedHelper(command: { file: string; args: string[] }, spec: LaunchSpec, environment: 'windows' | 'wsl2'): Promise<Result<OwnedExecution>> {
+export type SupervisorRawMeter = {
+  onRawBytes?: (source: 'helper', stream: 'stdout' | 'stderr', bytes: Uint8Array) => void;
+  /** Kernel creation time to observed exit is a conservative upper duration bound. */
+  onProcessCompleted?: (meter: {kind:'root'|'helper';identity:{pid:number;creationIdentity:string};activeMs:number}) => void;
+  waitHelperExit?: boolean;
+};
+export async function connectOwnedHelper(command: { file: string; args: string[] }, spec: LaunchSpec, environment: 'windows' | 'wsl2', rawMeter?: SupervisorRawMeter): Promise<Result<OwnedExecution>> {
   const helper = spawn(command.file, command.args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false });
   const decoder = new FrameDecoder({ runId: spec.runId, generation: spec.generation, actionId: spec.actionId, role: spec.role });
   let receipt: OwnershipReceipt | undefined;
@@ -122,6 +135,16 @@ export async function connectOwnedHelper(command: { file: string; args: string[]
   const listeners = new Set<(output: ChildOutput) => void>();
   const earlyOutput: ChildOutput[] = [];
   const pending = new Map<number, Pending>();
+  let resolveHelperExit!:()=>void, rejectHelperExit!:(error:Error)=>void;
+  const helperExit = new Promise<void>((resolve,reject)=>{resolveHelperExit=resolve;rejectHelperExit=reject;});void helperExit.catch(()=>{});
+  const completedMeter=(kind:'root'|'helper',pid:number,creationIdentity:string,exitedAt:number)=>{
+    if(!rawMeter?.onProcessCompleted)return;
+    if(!/^[a-f0-9]{16}$/i.test(creationIdentity))throw new Error('Unknown process kernel creation time');
+    const ticks=BigInt(`0x${creationIdentity}`),epoch=116444736000000000n;
+    if(ticks<epoch)throw new Error('Invalid process kernel creation time');
+    const createdAt=Number((ticks-epoch)/10000n);if(!Number.isSafeInteger(createdAt)||exitedAt<createdAt)throw new Error('Unknown process lifetime');
+    rawMeter.onProcessCompleted({kind,identity:{pid,creationIdentity},activeMs:exitedAt-createdAt});
+  };
   let resolveLaunch!: (receipt: OwnershipReceipt) => void;
   let rejectLaunch!: (error: Error) => void;
   const launched = new Promise<OwnershipReceipt>((resolve, reject) => { resolveLaunch = resolve; rejectLaunch = reject; });
@@ -134,6 +157,7 @@ export async function connectOwnedHelper(command: { file: string; args: string[]
   const fail = (error: Error): void => {
     if (stopped) return;
     stopped = error; fenced = true; endedInput = true;
+    rejectHelperExit(error);
     rejectLaunch(error); if (!drainEvidence) rejectDrain(error);
     for (const value of pending.values()) { clearTimeout(value.timer); value.reject(error); } pending.clear();
     helper.stdin.destroy();
@@ -146,9 +170,10 @@ export async function connectOwnedHelper(command: { file: string; args: string[]
   helper.stdout.on('error', error => fail(error));
   helper.stderr.on('error', error => fail(error));
   // Diagnostics can contain no child input; do not retain arbitrary helper stderr.
-  helper.stderr.resume();
+  helper.stderr.on('data', (bytes: Buffer) => { try { rawMeter?.onRawBytes?.('helper', 'stderr', bytes); } catch (error) { fail(error instanceof Error ? error : new Error(String(error))); } });
   helper.stdout.on('data', (bytes: Buffer) => {
     try {
+      rawMeter?.onRawBytes?.('helper', 'stdout', bytes);
       for (const frame of decoder.push(bytes)) {
         if (frame.type === 'launched') {
           if (receipt || frame.receipt.environment !== environment ||
@@ -171,6 +196,7 @@ export async function connectOwnedHelper(command: { file: string; args: string[]
                 JSON.stringify(frame.evidence.observationSlice) !== JSON.stringify(receipt.observationSlice) ||
                 JSON.stringify(frame.evidence.observer) !== JSON.stringify(receipt.observer)) throw new Error('WSL drainage incarnation mismatch');
           } else if ('environment' in frame.evidence) throw new Error('Windows drainage platform mismatch');
+          if(receipt.environment==='windows'&&frame.evidence.rootExitedAt!==null)completedMeter('root',receipt.pid,receipt.creationIdentity,frame.evidence.rootExitedAt);
           drainEvidence = frame.evidence; fenced = true; endedInput = true; resolveDrain(drainEvidence);
           for (const value of pending.values()) {
             clearTimeout(value.timer);
@@ -196,7 +222,12 @@ export async function connectOwnedHelper(command: { file: string; args: string[]
     clearTimeout(launchTimer);
     try { decoder.finish(); } catch (error) { fail(error as Error); return; }
     if (!drainEvidence) fail(new Error('Supervisor exited without drainage evidence; outcome unknown'));
+    else try {if(receipt?.environment==='windows')completedMeter('helper',receipt.helperPid,receipt.helperCreationIdentity,Date.now());resolveHelperExit();}catch(error){fail(error instanceof Error?error:new Error(String(error)));}
   });
+  const reconcileHelperExit=async(evidence:DrainEvidence):Promise<DrainEvidence>=>{
+    if(!rawMeter?.waitHelperExit)return evidence;
+    let timer:NodeJS.Timeout|undefined;try{await Promise.race([helperExit,new Promise<never>((_resolve,reject)=>{timer=setTimeout(()=>{const error=new Error('Actual helper exit unobserved');fail(error);reject(error);},5000);})]);return evidence;}finally{clearTimeout(timer);}
+  };
   const write = (frame: unknown): Promise<void> => new Promise((resolve, reject) => {
     let bytes: Buffer; try { bytes = encodeFrame(frame); } catch (error) { reject(error); return; }
     helper.stdin.write(bytes, error => error ? reject(error) : resolve());
@@ -216,6 +247,7 @@ export async function connectOwnedHelper(command: { file: string; args: string[]
     await launched;
   } catch (error) { clearTimeout(launchTimer); fail(error as Error); return failure('LAUNCH_FAILED', (error as Error).message); }
   const execution: OwnedExecution = {
+    async waitForDrain() { return await reconcileHelperExit(await drained); },
     async describe() { if (drainEvidence) return receipt!; const frame = await request('describe'); if (frame.type !== 'described') throw new Error('Missing ownership receipt'); return frame.receipt; },
     async fence() { if (fenced) return; fenced = true; endedInput = true; await request('fence'); },
     async renewLease(next) {
@@ -223,13 +255,13 @@ export async function connectOwnedHelper(command: { file: string; args: string[]
       leaseSequence = next; await request('renewLease', { leaseSequence: next });
     },
     async drain(reason) {
-      if (drainEvidence) return drainEvidence;
+      if (drainEvidence) return await reconcileHelperExit(drainEvidence);
       if (draining) return await draining;
       if (!reason.trim() || reason.length > 16384) throw new Error('Invalid drain reason');
       fenced = true; endedInput = true;
       draining = (async () => {
         await request('drain', { reason });
-        return await drained;
+        return await reconcileHelperExit(await drained);
       })();
       return await draining;
     },

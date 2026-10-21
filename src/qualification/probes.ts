@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { win32 } from 'node:path';
 import type { QualificationTarget } from './ledger.ts';
+import { buildCodexLaunchConfig, CODEX_CONFIG_SCHEMA, restrictedCodexOverrides } from '../providers/codex/launch-config.ts';
+import { evaluateStartupBlockers, type AcceptedStartupEvidence } from './startup-evidence.ts';
 
 export function fingerprint(value: unknown): string {
  const canonical = (item: unknown): unknown => Array.isArray(item) ? item.map(canonical) : item && typeof item === 'object'
@@ -37,7 +39,9 @@ export const STARTUP_BLOCKERS = Object.freeze([
  'PLUGIN_STARTUP_UNPROVEN', 'BROWSER_COMPUTER_STARTUP_UNPROVEN', 'MCP_INVENTORY_UNPROVEN',
  'MANAGED_REQUIREMENTS_UNVERIFIED', 'STRICT_CONFIG_RUNTIME_UNVERIFIED',
 ]);
-export function startupBlockers(): string[] { return [...STARTUP_BLOCKERS]; }
+export function startupBlockers(target?: QualificationTarget, evidence?: AcceptedStartupEvidence): string[] {
+ return target ? evaluateStartupBlockers(target, evidence).filter(decision => decision.state === 'OPEN').map(decision => decision.id) : [...STARTUP_BLOCKERS];
+}
 
 const verifierDriverOperations: Readonly<Record<string, string>> = Object.freeze({
  'verifier.allowed_command': 'allowed_edit',
@@ -56,11 +60,11 @@ export function createProbeManifest(fixtureRoot: string, target: QualificationTa
   [roots.controllerSentinel]: 'deny', [roots.sibling]: 'deny', [roots.fakeCredential]: 'deny' };
  const profile = { filesystem, network: { enabled: false, allow_local_binding: false, allow_upstream_proxy: false,
   dangerously_allow_all_unix_sockets: false, dangerously_allow_non_loopback_proxy: false, domains: {} } };
- const toml = (value: unknown): string => value && typeof value === 'object'
-  ? `{${Object.entries(value).map(([key, child]) => `${JSON.stringify(key)}=${toml(child)}`).join(',')}}` : JSON.stringify(value);
- const table = toml(profile);
- const overrides = ['-c', 'windows.sandbox="mxc"', '-c', `permissions.ouroboros_worker=${table}`, '-c', 'default_permissions="ouroboros_worker"',
-  '-c', 'features.apps=false', '-c', 'features.hooks=false', '-c', 'web_search="disabled"'];
+ const workerConfig=buildCodexLaunchConfig({entryPoint:'worker',schema:CODEX_CONFIG_SCHEMA,baseline:{permission:{kind:'named-profile',name:'ouroboros_worker'},
+  overrides:restrictedCodexOverrides({profileName:'ouroboros_worker',profile,defaultPermissions:true})}});
+ const verifierConfig=buildCodexLaunchConfig({entryPoint:'verifier',schema:CODEX_CONFIG_SCHEMA,baseline:{permission:{kind:'named-profile',name:'ouroboros_verifier'},
+  overrides:restrictedCodexOverrides({profileName:'ouroboros_verifier',profile,defaultPermissions:false})},verifier:{cwd:roots.workspace,command:[process.execPath]}});
+ if(!workerConfig.ok||!verifierConfig.ok)throw Error(!workerConfig.ok?workerConfig.error.code:!verifierConfig.ok?verifierConfig.error.code:'LAUNCH_CONFIG_INVALID');
  const commands = REQUIRED_CODEX_WINDOWS_PROBES.filter(probe => probe.role === 'verifier').map(probe => {
   const operation = verifierDriverOperations[probe.id];
   return operation ? { probeId: probe.id, supported: true as const, operation, executable: process.execPath,
@@ -77,12 +81,11 @@ export function createProbeManifest(fixtureRoot: string, target: QualificationTa
   ], bootstrap: 'fresh verifier qualification authority first; network=true, proxy=true and localhost-only policy are proposed for an independently owned endpoint batch, never inherited as measured evidence',
    directTcp: '127.0.0.1:18472', loopback: '127.0.0.1:18472', endpointsStarted: false as const },
   profiles: { initialNetworkDenied: profile },
-  startup: { executable: target.runtime.path, argv: ['app-server', '--strict-config', '--stdio', ...overrides], cwd: roots.workspace,
+  startup: { executable: target.runtime.path, argv: workerConfig.value.argv, cwd: roots.workspace,
    environmentKeys: ['SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'], credentials: 'runtime-managed in place; no token/cache reads, copies, env-value logging or auth commands',
    supportedRequestedControls: ['explicit MXC', 'named replaced permission profile', 'apps=false', 'hooks=false', 'web_search=disabled'],
    unprovenRequiredControls: startupBlockers(), safeToLaunch: false as const },
-  verifier: { executable: target.verifier.path, argvPrefix: ['-c', 'windows.sandbox="mxc"', '-c', `permissions.ouroboros_verifier=${table}`,
-   'sandbox', '--include-managed-config', '--permission-profile', 'ouroboros_verifier', '--cd', roots.workspace, '--'],
+  verifier: { executable: target.verifier.path, argvPrefix: verifierConfig.value.argv.slice(0,-1),
    command: { executable: process.execPath, argv: [win32.join(roots.driver, 'boundary-driver.mjs'), verifierDriverOperations['verifier.allowed_command'], fixtureRoot] },
    commands,
    authorization: 'fresh qualification request/probe/action/owner/launch hash; no qualified reference', safeToLaunch: false as const },

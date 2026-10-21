@@ -44,3 +44,10 @@ describe('fixed verifier command boundary',()=>{
    expect(compileCommandBoundary({...command,permittedOutputs:['/sys/fs/cgroup/owned']},fixture()).ok).toBe(false);
  });
 });
+
+it('a new verifier release requires matching runtime and full policy qualification rather than a release allowlist',()=>{
+  const profile=fixture();profile.verifier.version='0.0.80';expect(compileCommandBoundary(command,profile).ok).toBe(false);
+  profile.qualification.runtimeVersion='0.0.80';const {runId:_,generation:__,actionId:___,role:____,leaseTtlMs:_____,deadline:______,qualification:_______,...policy}=profile;
+  profile.qualification.policyHash=createHash('sha256').update(JSON.stringify(policy)).digest('hex');expect(compileCommandBoundary(command,profile).ok).toBe(true);
+  profile.verifier.sha256='e'.repeat(64);expect(compileCommandBoundary(command,profile).ok).toBe(false);
+});

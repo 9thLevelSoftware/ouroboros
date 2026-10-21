@@ -1,0 +1,33 @@
+{
+  "sourceCommit": "092d3acd6bec3e3a14bdc7e7a2810ab628ab759d",
+  "profile": {
+    "description": null,
+    "extends": null,
+    "workspace_roots": null,
+    "filesystem": {"glob_scan_max_depth": null},
+    "network": {
+      "enabled": null,
+      "proxy_url": null,
+      "enable_socks5": null,
+      "socks_url": null,
+      "enable_socks5_udp": null,
+      "allow_upstream_proxy": null,
+      "dangerously_allow_non_loopback_proxy": null,
+      "dangerously_allow_all_unix_sockets": null,
+      "mode": null,
+      "domains": null,
+      "unix_sockets": null,
+      "allow_local_binding": null,
+      "mitm": null
+    }
+  },
+  "shellEnvironmentPolicy": {
+    "inherit": null,
+    "ignore_default_excludes": null,
+    "exclude": null,
+    "set": null,
+    "include_only": null,
+    "filters": null,
+    "experimental_use_profile": null
+  }
+}

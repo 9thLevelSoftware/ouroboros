@@ -6,6 +6,7 @@ export const ExecutionOwnerSchema = z.strictObject({
 });
 export type ExecutionOwner = z.infer<typeof ExecutionOwnerSchema>;
 export const ExecutionAuthorizationSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('user-task'), authorizationId: IdSchema, taskHash: HashSchema }),
   z.strictObject({ kind: z.literal('qualified'), qualificationRef: TextSchema }),
   z.strictObject({ kind: z.literal('qualification'), requestId: IdSchema, probeId: TextSchema,
     fixtureRoots: z.array(PathSchema).min(1) }),
@@ -18,7 +19,10 @@ export const LaunchSpecSchema = z.strictObject({
   boundaryHash: HashSchema, authorization: ExecutionAuthorizationSchema,
   stdin: z.enum(['closed', 'pipe']).default('closed'),
   leaseTtlMs: PositiveLimitSchema.max(10000), deadline: PositiveLimitSchema,
-});
+  // Admission may expire before the already-authorized task lifetime ends.
+  launchNotAfter: PositiveLimitSchema.optional(),
+}).refine(spec => spec.launchNotAfter === undefined || spec.launchNotAfter <= spec.deadline,
+  { message: 'Launch cutoff must not exceed task deadline', path: ['launchNotAfter'] });
 export type LaunchSpec = z.infer<typeof LaunchSpecSchema>;
 export type LaunchInput = z.input<typeof LaunchSpecSchema>;
 export const WindowsOwnershipReceiptSchema = z.strictObject({
@@ -55,6 +59,8 @@ export const WindowsDrainEvidenceSchema = z.strictObject({
   schemaVersion: z.literal(1), ...ExecutionOwnerSchema.shape, reason: TextSchema,
   requestAcknowledged: z.boolean(), requestedAt: PositiveLimitSchema,
   acknowledgedAt: PositiveLimitSchema.nullable(), rootExited: z.boolean(), rootExitedAt: PositiveLimitSchema.nullable(),
+  // Absent in historical receipts; null means the owned handle did not yield a known exit code.
+  rootExitCode: z.number().int().nonnegative().max(4294967295).nullable().optional(),
   membershipEmpty: z.boolean(), membershipObservedAt: PositiveLimitSchema,
   activeProcesses: z.number().int().nonnegative(), unresolvedExecutions: z.array(PositiveLimitSchema),
   outputComplete: z.boolean(), unresolvedOutputStreams: z.array(z.enum(['stdout', 'stderr'])),
@@ -64,6 +70,7 @@ export const WindowsDrainEvidenceSchema = z.strictObject({
   if (evidence.membershipEmpty !== (evidence.activeProcesses === 0) ||
       evidence.requestAcknowledged !== (evidence.acknowledgedAt !== null) ||
       evidence.rootExited !== (evidence.rootExitedAt !== null) ||
+      (!evidence.rootExited && evidence.rootExitCode != null) ||
       (evidence.membershipEmpty && evidence.unresolvedExecutions.length !== 0)) {
     ctx.addIssue({ code: 'custom', message: 'Inconsistent drain evidence' });
   }
@@ -101,6 +108,8 @@ export interface OwnedExecution {
   fence(): Promise<void>;
   renewLease(sequence: number): Promise<void>;
   drain(reason: string): Promise<DrainEvidence>;
+  /** Observe natural terminal evidence without requesting cancellation or fencing. */
+  waitForDrain?(): Promise<DrainEvidence>;
   onOutput(listener: (output: ChildOutput) => void): () => void;
   writeInput(bytes: Uint8Array): Promise<Result<void>>;
   endInput(): Promise<Result<void>>;

@@ -369,6 +369,7 @@ fn bridge() -> Result<(), Error> {
     if spec.owner() != initial.owner() || spec.deadline <= now() {
         return Err("launch owner/deadline mismatch".into());
     }
+    spec.ensure_launch_current(now())?;
     let root = spool_path(&spec.owner())?;
     let parent = root.parent().unwrap();
     DirBuilder::new()
@@ -439,15 +440,10 @@ fn child(spec_path: &Path) -> Result<(), Error> {
     if gate != [0x7e] {
         return Err("pre-exec gate not released".into());
     }
-    if spec.deadline <= now() {
-        return Err("deadline before exec".into());
-    }
-    let error = Command::new(&spec.executable)
-        .args(&spec.argv)
-        .current_dir(&spec.cwd)
-        .env_clear()
-        .envs(&spec.env)
-        .exec();
+    let mut command = Command::new(&spec.executable);
+    command.args(&spec.argv).current_dir(&spec.cwd).env_clear().envs(&spec.env);
+    spec.ensure_launch_current(now())?;
+    let error = command.exec();
     Err(error.into())
 }
 fn target(spec_path: &Path) -> Result<(), Error> {
@@ -466,6 +462,7 @@ fn target(spec_path: &Path) -> Result<(), Error> {
     if prepare != json!({"type":"prepare"}) {
         return Err("invalid target prepare".into());
     }
+    spec.ensure_launch_current(now())?;
     let mut root = Command::new(std::env::current_exe()?)
         .arg("child")
         .arg(spec_path)

@@ -272,7 +272,8 @@ it('review2_known_folders_cross_check_profile', () => {
 function cliFixture() {
  mkdirSync(scratch, { recursive: true }); const base = mkdtempSync(join(scratch, 'cli-'));
  const runtime = join(base, 'codex.exe'); const helper = join(base, 'helper.exe'); writeFileSync(runtime, 'fake codex'); writeFileSync(helper, 'fake helper');
- const fixtureRoot = join(resolve('.superpowers/sdd/2026-10-13-ouroboros-implementation/task-7-disposable'), `cli-unit-${randomUUID()}`);
+ // Keep the absent fixture outside repository ancestors so config-layer guards remain genuine.
+ const container = mkdtempSync(join(dirname(resolve('.')), 'ouroboros-cli-unit-')); const fixtureRoot = join(container, 'fixture');
  const controllerRoot = join(base, 'controller'); const programData = join(base, 'ProgramData'); const profile = join(base, 'profile'); mkdirSync(profile);
  const args = { provider: 'codex' as const, environment: 'windows' as const, fixtureRoot, model: 'fixture', effort: 'high' };
  const options = { installationRoot: resolve('.'), controllerRoot, runtimePath: runtime, helperPath: helper, pinnedRuntimeHash: sha(runtime), knownFolders: () => ({ programData, profile }) };

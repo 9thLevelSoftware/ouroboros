@@ -1,5 +1,9 @@
 # Ouroboros: subscription-backed software engineering harness
 
+> Runtime contract update, 2026-10-21: the [authorized flexible-runtime continuation](../plans/2026-10-21-flexible-runtime-support.md) replaces fixed release allowlists with immutable per-run executable/control identities, Node 24 minimum plus capability checks, and compatibility observations in existing owned startup exchanges. Generated schemas and exact versions below remain historical evidence. Qualification is still bound to exact actual target identities and never transfers automatically to a newer runtime. This update grants no live campaign retry or qualification acceptance.
+
+> Task 7 update, 2026-10-16: the [documented OAuth/app-server integration design](2026-10-16-task-7-documented-integration-design.md) governs Codex startup admission and qualification. It retains managed ChatGPT sign-in for personal v1, documents the supported third-party OAuth alternative, and supersedes the later proposed universal pre-process certificate requirement. All five blockers remain open; this documentation correction grants no live-run permission.
+
 Date: 2026-10-13
 
 Status: Written design approved by the user on 2026-10-13. This document does not authorize implementation, installation, commits, publication, or deployment. The next artifact is a separate, detailed implementation plan for review.

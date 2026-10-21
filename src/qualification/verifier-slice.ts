@@ -6,6 +6,7 @@ import { WindowsDrainEvidenceSchema, WindowsOwnershipReceiptSchema, type ChildOu
 import { storeError, type RunStore } from '../store/database.ts';
 import { publishArtifact } from '../store/artifacts.ts';
 import { fingerprint, type ProbeManifest } from './probes.ts';
+import { buildCodexLaunchConfig, CODEX_CONFIG_SCHEMA, restrictedCodexOverrides } from '../providers/codex/launch-config.ts';
 import type { ProbeAttempt, ProbeObservation, QualificationLedger, QualificationRequest } from './ledger.ts';
 
 /** First live verifier slice. The read denial runs first: the allowed edit cannot by
@@ -127,9 +128,11 @@ export type SealedVerifierSlice = { schemaVersion: 1; fixtureRoot: string; works
 /** targetHash binds the complete target, including the wrapper hash over the controller sources that enforce and classify this run. */
 export function sealVerifierSlice(manifest: ProbeManifest, input: { codex: Pinned; helper: Pinned; node: Pinned; driverSha256: string; env: Record<string, string>; config: ConfigLayerObservation; targetHash: string }): Result<SealedVerifierSlice> {
  const profile = validateVerifierProfile(manifest.profiles.initialNetworkDenied); if (!profile.ok) return profile;
- const toml = (value: unknown): string => value && typeof value === 'object' ? `{${Object.entries(value).map(([key, child]) => `${JSON.stringify(key)}=${toml(child)}`).join(',')}}` : JSON.stringify(value);
- const expectedPrefix = ['-c', 'windows.sandbox="mxc"', '-c', `permissions.ouroboros_verifier=${toml(manifest.profiles.initialNetworkDenied)}`,
-  'sandbox', '--include-managed-config', '--permission-profile', 'ouroboros_verifier', '--cd', manifest.roots.workspace, '--'];
+ const config=buildCodexLaunchConfig({entryPoint:'verifier',schema:CODEX_CONFIG_SCHEMA,baseline:{permission:{kind:'named-profile',name:'ouroboros_verifier'},
+  overrides:restrictedCodexOverrides({profileName:'ouroboros_verifier',profile:manifest.profiles.initialNetworkDenied,defaultPermissions:false})},
+  verifier:{cwd:manifest.roots.workspace,command:[input.node.path]}});
+ if(!config.ok)return storeError('VERIFIER_PROFILE_INVALID','Verifier launch configuration failed structural preflight');
+ const expectedPrefix=config.value.argv.slice(0,-1);
  if (JSON.stringify(manifest.verifier.argvPrefix) !== JSON.stringify(expectedPrefix)) return storeError('VERIFIER_PROFILE_INVALID', 'Manifest verifier argv does not carry the validated profile');
  if (Object.keys(input.env).sort().join() !== [...ENV_KEYS].sort().join() || Object.entries(input.env).some(([key, v]) => key !== 'SystemDrive' && !win32.isAbsolute(v)) ||
   !/^[A-Za-z]:$/.test(input.env.SystemDrive) || win32.parse(input.env.SystemRoot).root.slice(0, 2).toUpperCase() !== input.env.SystemDrive.toUpperCase() ||

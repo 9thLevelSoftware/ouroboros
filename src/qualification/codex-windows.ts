@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import type { Result } from '../contracts/common.ts';
 import type { LaunchSpec, Supervisor } from '../contracts/execution.ts';
 import { openStore, storeError } from '../store/database.ts';
-import { CODEX_BINARY_HASH, CODEX_VERSION } from '../providers/codex/adapter.ts';
+import { installedCodexVersion, resolveExecutable, supportedNodeVersion } from '../runtime/compatibility.ts';
 import { QualificationLedger, targetFingerprint, type QualificationTarget, type QualificationRequest, type QualificationReport } from './ledger.ts';
 import { createProbeManifest, fingerprint, startupBlockers, REQUIRED_CODEX_WINDOWS_PROBES, type ProbeManifest } from './probes.ts';
 import { createSliceRequest, inspectConfigLayers, runVerifierSlice, sealVerifierSlice, slicePermit } from './verifier-slice.ts';
@@ -36,13 +36,17 @@ export async function qualify(target: QualificationTarget, approval: Qualificati
  const history = options.ledger.history(approval.id);
  if (!history.ok) throw Error('Durable current approval required');
  if (fingerprint(history.value.request) !== fingerprint(approval)) throw Error('Qualification approval changed');
- const report = options.ledger.report(approval.id, startupBlockers());
+ const report = options.ledger.report(approval.id);
  if (!report.ok) throw Error('Qualification report persistence failed');
  return report.value;
 }
 
 function fileHash(path: string): string { return createHash('sha256').update(readFileSync(path)).digest('hex'); }
 function sourceHash(root: string, paths: string[]): string { return fingerprint(paths.map(path => ({ path, sha256: fileHash(join(root, path)) }))); }
+/** Includes executed launch validation/schema bytes and expected dependency resolution.
+ * Installed dependency bytes require a separate verified preparation receipt. */
+export const CODEX_ADAPTER_SOURCES=['src/providers/codex/adapter.ts','src/providers/codex/transport.ts','src/providers/codex/policy.ts','src/providers/codex/startup-metadata.ts','src/providers/codex/launch-config.ts','src/runtime/compatibility.ts','src/qualification/codex-startup-authority.ts','src/providers/provider.ts','src/contracts/provider.ts','src/contracts/execution.ts','src/contracts/common.ts','src/runtime/command-boundary.ts','package.json','package-lock.json'] as const;
+export function codexAdapterSourceHash(root:string):string{return sourceHash(root,[...CODEX_ADAPTER_SOURCES]);}
 function contained(path: string, root: string): boolean { const relative = win32.relative(root, path); return relative === '' || relative !== '..' && !relative.startsWith('..\\') && !win32.isAbsolute(relative); }
 function noAliases(path: string): void {
  let current = win32.parse(path).root;
@@ -57,20 +61,32 @@ export type QualificationCli = (args: QualificationArguments, showManifest: (man
 type CliOptions = { installationRoot?: string; controllerRoot?: string; runtimePath?: string; helperPath?: string; pinnedRuntimeHash?: string;
  supervisorFor?: (authorize: (spec: Readonly<LaunchSpec>) => Promise<boolean>) => Supervisor; knownFolders?: () => { programData: string; profile: string } };
 /** Every controller source the slice loads or depends on, plus the lockfile and fixed drivers; sorted, repository-relative. */
+export const QUALIFICATION_RESOURCE_PATHS = [
+ 'tests/fixtures/boundary/boundary-driver.mjs',
+ 'tests/fixtures/boundary/heartbeat.mjs',
+ 'tests/fixtures/boundary/campaign-boundary-driver.mjs',
+ 'tests/fixtures/boundary/controlled-endpoint.mjs',
+ 'tests/fixtures/boundary/session-activity.mjs',
+ 'tests/fixtures/boundary/disposable-controller.mjs',
+] as const;
 export function controllerSources(root: string): string[] {
  const files: string[] = [];
  const walk = (relative: string) => { for (const item of readdirSync(join(root, relative), { withFileTypes: true })) { const next = `${relative}/${item.name}`; if (item.isDirectory()) walk(next); else if (item.isFile()) files.push(next); } };
  walk('src');
- return [...files, 'package-lock.json', 'tests/fixtures/boundary/boundary-driver.mjs', 'tests/fixtures/boundary/heartbeat.mjs'].sort();
+ return [...files, 'package.json', 'package-lock.json', ...QUALIFICATION_RESOURCE_PATHS].sort();
 }
+/** The same source/resource projection is used by target preparation and rechecks. */
+export function qualificationControllerSourceHash(root: string): string { return sourceHash(root, controllerSources(root)); }
 /** Passive target/manifest derivation shared by full qualification and the verifier slice. Writes nothing. */
 function prepareTarget(options: CliOptions, args: QualificationArguments) {
  if (process.platform !== 'win32') throw Error('Native Codex qualification requires Windows');
  const root = resolve(options.installationRoot ?? process.cwd());
  const controllerRoot = options.controllerRoot ?? (process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Ouroboros', 'controller') : undefined);
- const runtimePath = options.runtimePath ?? (process.env.APPDATA ? join(process.env.APPDATA, 'npm/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe') : undefined);
- if (!controllerRoot || !runtimePath) throw Error('Pinned runtime and trusted controller roots required');
- const helperPath = options.helperPath ?? join(root, 'native/supervisor/target/debug/ouroboros-supervisor.exe');
+ const runtimeCandidate = options.runtimePath ?? (process.env.APPDATA ? join(process.env.APPDATA, 'npm/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe') : undefined);
+ if (!controllerRoot || !runtimeCandidate) throw Error('Runtime and trusted controller roots required');
+ const runtimePath=resolveExecutable(runtimeCandidate);
+ if(!supportedNodeVersion(process.versions.node))throw Error('NODE_CAPABILITY_UNSUPPORTED: Node >=24 required');
+ const helperPath = resolveExecutable(options.helperPath ?? join(root, 'native/supervisor/target/debug/ouroboros-supervisor.exe'));
  const scopedScratch = join(root, '.superpowers/sdd/2026-10-13-ouroboros-implementation/task-7-disposable');
  const fixtureRoot = win32.normalize(args.fixtureRoot);
  if (existsSync(fixtureRoot) || fixtureRoot === win32.parse(fixtureRoot).root || contained(fixtureRoot, controllerRoot) || contained(controllerRoot, fixtureRoot) ||
@@ -78,12 +94,13 @@ function prepareTarget(options: CliOptions, args: QualificationArguments) {
   (contained(fixtureRoot, root) && (!contained(fixtureRoot, scopedScratch) || fixtureRoot === scopedScratch))) throw Error('Fresh separately scoped disposable fixture root required');
  noAliases(fixtureRoot); noAliases(controllerRoot);
  // pinnedRuntimeHash is a programmatic test seam only; the CLI never passes it.
- if (fileHash(runtimePath) !== (options.pinnedRuntimeHash ?? CODEX_BINARY_HASH)) throw Error('Pinned native runtime changed; new target qualification required');
+ if (options.pinnedRuntimeHash!==undefined&&fileHash(runtimePath)!==options.pinnedRuntimeHash) throw Error('Qualification runtime identity changed');
+ const runtimeVersion=installedCodexVersion(runtimePath);
  const os = { platform: 'win32' as const, architecture: arch(), release: release(), sha256: fingerprint({ platform: process.platform, architecture: arch(), release: release(), node: process.version }) };
- const target: QualificationTarget = { schemaVersion: 1, provider: 'codex', environment: 'windows', runtime: { path: runtimePath, version: CODEX_VERSION, sha256: fileHash(runtimePath) },
-  adapter: { version: '0.1.0', sha256: sourceHash(root, ['src/providers/codex/adapter.ts', 'src/providers/codex/transport.ts', 'src/providers/codex/policy.ts', 'src/providers/provider.ts', 'src/contracts/provider.ts']) },
-  helper: { path: helperPath, version: '0.1.0', sha256: fileHash(helperPath) }, verifier: { path: runtimePath, version: CODEX_VERSION, sha256: fileHash(runtimePath),
-   wrapperHash: fingerprint({ node: { path: process.execPath, version: process.version, sha256: fileHash(process.execPath) }, source: sourceHash(root, controllerSources(root)) }) },
+ const target: QualificationTarget = { schemaVersion: 1, provider: 'codex', environment: 'windows', runtime: { path: runtimePath, version: runtimeVersion, sha256: fileHash(runtimePath) },
+  adapter: { version: '0.1.0', sha256: codexAdapterSourceHash(root) },
+  helper: { path: helperPath, version: '0.1.0', sha256: fileHash(helperPath) }, verifier: { path: runtimePath, version: runtimeVersion, sha256: fileHash(runtimePath),
+   wrapperHash: fingerprint({ node: { path: process.execPath, version: process.version, sha256: fileHash(process.execPath) }, source: qualificationControllerSourceHash(root) }) },
   os, policyHash: '0'.repeat(64), startupConfigHash: '0'.repeat(64), model: args.model, effort: args.effort };
  const candidate = createProbeManifest(fixtureRoot, target);
  target.policyHash = fingerprint({ profiles: candidate.profiles, network: candidate.network, requiredProbes: candidate.probes });
@@ -95,7 +112,7 @@ function writeFixture(root: string, fixtureRoot: string, manifest: ProbeManifest
  for (const path of Object.values(manifest.roots)) mkdirSync(path, { recursive: true });
  for (const sentinel of manifest.sentinels) writeFileSync(sentinel.path, sentinel.bytes, { flag: 'wx' });
  writeFileSync(join(manifest.roots.workspace, 'allowed.txt'), 'allowed fixture baseline\r\n', { flag: 'wx' });
- for (const name of ['boundary-driver.mjs', 'heartbeat.mjs']) copyFileSync(join(root, 'tests/fixtures/boundary', name), join(manifest.roots.driver, name), constants.COPYFILE_EXCL);
+ for (const path of QUALIFICATION_RESOURCE_PATHS) copyFileSync(join(root, path), join(manifest.roots.driver, win32.basename(path)), constants.COPYFILE_EXCL);
  writeFileSync(join(fixtureRoot, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n', { flag: 'wx' });
 }
 
@@ -189,7 +206,7 @@ export function createVerifierSliceCli(options: CliOptions = {}): VerifierSliceC
     writeFileSync(join(fixtureRoot, 'seal.json'), JSON.stringify(seal, null, 2) + '\n', { flag: 'wx' });
    } catch (error) { store.release(owner.value); throw error; }
    const outcome = await runVerifierSlice(seal, { ledger, store, requestId: request.id, supervisorFor: options.supervisorFor ?? (authorize => createSupervisor({ helperPath, authorize })), inspectConfig });
-   const report = ledger.report(request.id, startupBlockers());
+   const report = ledger.report(request.id);
    const released = store.release(owner.value);
    const probes = outcome.ok ? outcome.value.attempts.map(a => ({ probeId: a.probeId, status: a.observation?.status ?? 'UNTESTED', result: a.observation?.result ?? 'not_attempted',
     reasonCode: a.observation?.reasonCode ?? 'UNRESOLVED', evidenceIds: a.observation?.evidence.map(e => e.id) ?? [] })) : [];

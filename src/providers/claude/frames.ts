@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { ExecutionOwnerSchema, type ExecutionOwner } from '../../contracts/execution.ts';
-import { ClaudeOptionsSchema, sameOwner } from '../../../adapters/claude/src/options.ts';
+import { ClaudeOptionsSchema, sameOwner } from './options.ts';
 
 export const MAX_CLAUDE_FRAME=1024*1024;
 export const MAX_CLAUDE_OUTPUT=10*1024*1024;
