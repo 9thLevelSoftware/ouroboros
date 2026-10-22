@@ -2,6 +2,7 @@ import {createHash} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {z} from 'zod';
+import {isUnlimited,type CampaignRemaining} from './campaign-policy.ts';
 import {HashSchema, IdSchema} from '../contracts/common.ts';
 import {OwnerTokenSchema} from '../contracts/evidence.ts';
 import type {QualificationEnvelope, RunStore} from '../store/database.ts';
@@ -52,7 +53,7 @@ function accountingBytes(store:RunStore,runId:string,ref:AccountingEvidence):Buf
  return bytes;
 }
 export function readAccountingEvidence(store:RunStore,runId:string,ref:AccountingEvidence):unknown{return JSON.parse(accountingBytes(store,runId,ref).toString('utf8'));}
-type Context={campaignId:string;owner:z.infer<typeof OwnerTokenSchema>;targetHash:string;failures:Array<{actionId:string}>;correctionIds:string[];correctionUsage:number;unsuccessfulCorrections:number;consumed:{actions:number;activeMs:number;outputBytes:number};limits:{actions:number;activeMs:number;outputBytes:number};maxUnsuccessfulCorrections?:number;usedSources:Set<string>};
+type Context={campaignId:string;owner:z.infer<typeof OwnerTokenSchema>;targetHash:string;failures:Array<{actionId:string}>;correctionIds:string[];correctionUsage:number;unsuccessfulCorrections:number;consumed:{actions:number;activeMs:number;outputBytes:number};limits:CampaignRemaining;maxUnsuccessfulCorrections?:number;usedSources:Set<string>};
 export function deriveAccounting(store:RunStore,rows:QualificationEnvelope[],receipt:CampaignAccounting,context:Context){
  if(receipt.campaignId!==context.campaignId||fingerprint(receipt.owner)!==fingerprint(context.owner)||receipt.targetHash!==context.targetHash||receipt.storeRootHash!==fingerprint(store.root)||receipt.historyHash!==fingerprint(rows))throw Error('Accounting binding mismatch');
  const historical=receipt.historicalExecutions??[];
@@ -106,7 +107,7 @@ export function deriveAccounting(store:RunStore,rows:QualificationEnvelope[],rec
    for(const process of group.processes){consume(`historical-process:${fingerprint({pid:process.pid,creationIdentity:process.creationIdentity})}`);charges.activeMs+=process.completedAt-process.createdAt;}
   }
  }
- for(const key of ['actions','activeMs','outputBytes'] as const)if(!Number.isSafeInteger(charges[key])||!Number.isSafeInteger(context.consumed[key]+charges[key])||context.consumed[key]+charges[key]>context.limits[key])throw Error('Accounting exceeds allowance');
+ for(const key of ['actions','activeMs','outputBytes'] as const)if(!Number.isSafeInteger(charges[key])||!Number.isSafeInteger(context.consumed[key]+charges[key])||(!isUnlimited(context.limits)&&context.consumed[key]+charges[key]>context.limits[key]))throw Error('Accounting exceeds allowance');
  if(context.unsuccessfulCorrections+unsuccessful>(context.maxUnsuccessfulCorrections??2))throw Error('Correction ceiling exceeded');
  return {charges,correctionIds,unsuccessful,resolvedActionIds,usedSources:used};
 }

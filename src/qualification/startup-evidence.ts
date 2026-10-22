@@ -52,7 +52,7 @@ export const StartupLocalScopeSchema=z.strictObject({schemaVersion:z.literal(1),
  controllerHash:HashSchema,protocolHash:HashSchema,fixtureHash:HashSchema,environmentHash:HashSchema,controlHash:HashSchema,intentHash:HashSchema,
  configuration:SafeConflictConfigSchema,
  preparation:z.strictObject({actionId:IdSchema,runId:IdSchema,generation:PositiveLimitSchema,observedAt:PositiveLimitSchema,operation:z.literal('atomic-new-empty-directory'),sqliteHomeHash:HashSchema,initialEntries:z.array(z.never()).length(0)}),
- client:z.strictObject({name:z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),transport:z.literal('stdio'),environment:z.literal('local'),threadMode:z.literal('new-only'),reconfiguration:z.literal('none'),remoteStartup:z.literal('resolve-persisted'),
+ client:z.strictObject({name:z.string().regex(/^[A-Za-z0-9_-]{1,128}$/),transport:z.literal('stdio'),environment:z.literal('local'),threadMode:z.literal('new-only'),reconfiguration:z.literal('none'),remoteStartup:z.literal('resolve-persisted'),dynamicTools:z.literal('none').optional(),selectedCapabilityRoots:z.literal('none').optional(),remoteEnvironments:z.literal('none').optional(),
   allowedMethods:z.array(z.enum(['initialize','initialized','account/read','config/read','configRequirements/read','thread/start','turn/start','turn/interrupt'])).min(5).max(8).refine(values=>new Set(values).size===values.length)}),
 });
 export type StartupLocalScope=z.infer<typeof StartupLocalScopeSchema>;
@@ -93,7 +93,7 @@ export const StartupCoverageManifestSchema = z.strictObject({ schemaVersion: z.l
   registrationHash: HashSchema.optional(), monitorHash: HashSchema.optional() })).min(1).max(208),
  exclusions: z.array(z.enum(['thread-resume','reload','desktop-client','remote-client'])).max(4),
  managedConflict: ref.optional(), scopeEvidence:ref.optional(), boundaryEvidence: z.array(ref).max(32),
- sourceCatalog:z.array(source).max(64).optional(),
+ sourceCatalog:z.array(source).max(256).optional(),
  requirementsSources: z.array(z.strictObject({ source: z.enum(STARTUP_SOURCES), sourceEvidence: z.array(source).min(1).max(16) })).max(8).optional(),
 });
 export type StartupCoverageManifest = z.infer<typeof StartupCoverageManifestSchema>;
@@ -132,8 +132,8 @@ export function validateStartupCoverageForPreparation(store:RunStore,target:Qual
  const intent=StartupIntentSchema.parse(rawIntent),manifest=StartupCoverageManifestSchema.parse(input);
  if(!targetMatchesIntent(target,intent)||manifest.targetHash!==fingerprint(target)||manifest.fixtureHash!==fixtureHash||manifest.controlHash!==intent.controlHash||manifest.controllerHash!==intent.controllerHash||manifest.protocolHash!==intent.protocolHash||manifest.environmentHash!==intent.environmentHash||manifest.expectedPolicy.environmentHash!==intent.environmentHash)throw Error('STARTUP_COVERAGE_BINDING_CHANGED');
  const keys=manifest.routes.map(route=>`${route.path}:${route.source}:${route.lifecycle}`);if(new Set(keys).size!==keys.length)throw Error('CONTRADICTORY_COVERAGE');
- for(const route of [...manifest.routes,...manifest.requirementsSources??[]])for(const source of route.sourceEvidence){const loaded=readArtifact(store,source.artifact);if(loaded.artifact.sha256!==source.blobHash)throw Error('SOURCE_BLOB_CHANGED');}
- for(const source of manifest.sourceCatalog??[]){const loaded=readArtifact(store,source.artifact);if(loaded.artifact.sha256!==source.blobHash)throw Error('SOURCE_BLOB_CHANGED');}
+ for(const route of [...manifest.routes,...manifest.requirementsSources??[]])for(const source of route.sourceEvidence){const loaded=readArtifact(store,source.artifact,8388608);if(loaded.artifact.sha256!==source.blobHash)throw Error('SOURCE_BLOB_CHANGED');}
+ for(const source of manifest.sourceCatalog??[]){const loaded=readArtifact(store,source.artifact,8388608);if(loaded.artifact.sha256!==source.blobHash)throw Error('SOURCE_BLOB_CHANGED');}
  if(manifest.scopeEvidence){const scope=StartupLocalScopeSchema.parse(readJson(store,manifest.scopeEvidence).value);if(scope.targetHash!==manifest.targetHash||scope.fixtureHash!==fixtureHash||scope.controllerHash!==manifest.controllerHash||scope.protocolHash!==manifest.protocolHash||scope.environmentHash!==manifest.environmentHash||scope.controlHash!==manifest.controlHash||fingerprint(scope.configuration)!==manifest.expectedPolicy.configurationHash||scope.configuration.sqliteHomeHash!==scope.preparation.sqliteHomeHash||scope.preparation.runId!==intent.owner.runId||scope.preparation.generation!==intent.owner.generation)throw Error('LOCAL_SCOPE_BINDING_CHANGED');}
  return manifest;
 }
@@ -143,7 +143,7 @@ export const StartupAcceptanceSchema = z.strictObject({ schemaVersion: z.literal
 }).refine(value => value.reviewerId !== value.producerId && new Set(value.acceptedClaims).size === value.acceptedClaims.length && !value.acceptedClaims.some(id => value.unresolvedClaims.includes(id)) &&
  (value.coverage!==undefined||value.acceptedClaims.every(id=>id==='STRICT_CONFIG_RUNTIME_UNVERIFIED')&&!!value.strictSources?.length), 'Independent non-conflicting review and claim-specific source evidence required');
 export type StartupAcceptance = z.infer<typeof StartupAcceptanceSchema>;
-type LoadedReview = { review: StartupAcceptance; manifest?: StartupCoverageManifest; proofs: Array<{ ref: StartupArtifactRef; proof: StartupSessionProof; batch: { fixtureHash: string } }>; refs: StartupArtifactRef[]; managedAccepted:boolean };
+type LoadedReview = { review: StartupAcceptance; manifest?: StartupCoverageManifest; proofs: Array<{ ref: StartupArtifactRef; proof: StartupSessionProof; batch: { fixtureHash: string } }>; refs: StartupArtifactRef[]; managedAccepted:boolean; scope?:StartupLocalScope };
 export type AcceptedStartupEvidence = Readonly<{ targetHash: string; issues: readonly string[] }>;
 const validated = new WeakMap<AcceptedStartupEvidence, { reviews:readonly LoadedReview[]; store:RunStore; historyHash:string }>();
 export type StartupEvidenceOptions = { reviews?: readonly StartupArtifactRef[]; acceptedReviewHashes?: readonly string[] };
@@ -158,16 +158,16 @@ function completeDrain(proof: StartupSessionProof) {
  return d.helperExited && d.controllerExited && d.outerMembershipEmpty === true && d.outerQueryError === null && !d.emergencyTerminated && !d.overflow && !d.readerFailure && !d.processMeterError &&
   d.description.root.pid === o.pid && d.description.root.creationIdentity === o.creationIdentity && d.description.helper.pid === o.helperPid && d.description.helper.creationIdentity === o.helperCreationIdentity && d.description.innerJobIdentity === o.jobIdentity && d.description.boundaryHash === o.boundaryHash && d.rootLifetimeMs !== null && d.helperLifetimeMs !== null;
 }
-function readArtifact(store: RunStore, input: StartupArtifactRef) {
+function readArtifact(store: RunStore, input: StartupArtifactRef,maxBytes=262144) {
  const pointer = ref.parse(input), loaded = store.loadArtifact(pointer.id);
  if (!loaded.ok) throw Error('ARTIFACT_MISSING');
  const artifact = loaded.value;
- if (artifact.sha256 !== pointer.sha256 || artifact.truncated || artifact.producerStopRequired || artifact.redactionApplied || artifact.rawBytes !== artifact.storedBytes || artifact.storedBytes > 262144) throw Error('ARTIFACT_INCOMPLETE');
+ if (artifact.sha256 !== pointer.sha256 || artifact.truncated || artifact.producerStopRequired || artifact.redactionApplied || artifact.rawBytes !== artifact.storedBytes || artifact.storedBytes > maxBytes) throw Error('ARTIFACT_INCOMPLETE');
  const bytes = readFileSync(join(store.root, 'artifacts', artifact.sha256));
  if (bytes.length !== artifact.storedBytes || createHash('sha256').update(bytes).digest('hex') !== pointer.sha256) throw Error('ARTIFACT_CHANGED');
  return { artifact, bytes };
 }
-function readJson(store: RunStore, input: StartupArtifactRef) { const loaded = readArtifact(store, input); return { ...loaded, value: JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(loaded.bytes)) as unknown }; }
+function readJson(store: RunStore, input: StartupArtifactRef,maxBytes=262144) { const loaded = readArtifact(store, input,maxBytes); return { ...loaded, value: JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(loaded.bytes)) as unknown }; }
 function rowsForAction(rows: QualificationEnvelope[], actionId: string, kind: QualificationEnvelope['kind']) { return rows.filter(row => row.kind === kind && row.actionId === actionId); }
 function durableProof(store: RunStore, rows: QualificationEnvelope[], target: QualificationTarget, pointer: StartupArtifactRef) {
  const loaded = readJson(store, pointer), proof = StartupSessionProofSchema.parse(loaded.value), i = proof.intent, targetHash = fingerprint(target), actionId = i.owner.actionId;
@@ -214,15 +214,16 @@ export function loadStartupEvidence(store: RunStore, target: QualificationTarget
     if (!options.acceptedReviewHashes?.includes(pointer.sha256)) throw Error('UNACCEPTED_REVIEW');
     const review = StartupAcceptanceSchema.parse(readJson(store, pointer).value);
     if (review.targetHash !== targetHash) throw Error('REVIEW_TARGET_CHANGED');
-    const manifest = review.coverage?StartupCoverageManifestSchema.parse(readJson(store, review.coverage).value):undefined;
+    const manifest = review.coverage?StartupCoverageManifestSchema.parse(readJson(store, review.coverage,4194304).value):undefined;
     if (manifest&&(manifest.targetHash !== targetHash || !['thread-resume','reload','desktop-client','remote-client'].every(path => manifest.exclusions.includes(path as typeof manifest.exclusions[number])))) throw Error('SCOPE_UNBOUNDED');
     const refs = [pointer, ...(review.coverage?[review.coverage]:[]), ...review.observations];
     const sources=[...(review.strictSources??[]),...(manifest?[...manifest.routes,...manifest.requirementsSources??[]].flatMap(route=>route.sourceEvidence):[]),...(manifest?.sourceCatalog??[])];
-    for (const source of sources) { const loaded = readArtifact(store, source.artifact); if (loaded.artifact.sha256 !== source.blobHash) throw Error('SOURCE_BLOB_CHANGED'); refs.push(source.artifact); }
+    for (const source of sources) { const loaded = readArtifact(store, source.artifact,8388608); if (loaded.artifact.sha256 !== source.blobHash) throw Error('SOURCE_BLOB_CHANGED'); refs.push(source.artifact); }
     const routeKeys = (manifest?.routes??[]).map(route => `${route.path}:${route.source}:${route.lifecycle}`);
     if (new Set(routeKeys).size !== routeKeys.length) throw Error('CONTRADICTORY_COVERAGE');
     const proofs = review.observations.map(item => durableProof(store, rows, target, item));
-    if(manifest?.scopeEvidence){const scope=readJson(store,manifest.scopeEvidence);const scoped=proofs.find(item=>fingerprint(item.proof.intent)===body(scope.value).intentHash);if(!scoped||scope.artifact.runId!==scoped.proof.intent.owner.runId)throw Error('LOCAL_SCOPE_PROOF_REQUIRED');validateStartupLocalScope(scope.value,scoped.proof,targetHash,manifest.fixtureHash);refs.push(manifest.scopeEvidence);}
+    let localScope:StartupLocalScope|undefined;
+    if(manifest?.scopeEvidence){const scope=readJson(store,manifest.scopeEvidence);const scoped=proofs.find(item=>fingerprint(item.proof.intent)===body(scope.value).intentHash);if(!scoped||scope.artifact.runId!==scoped.proof.intent.owner.runId)throw Error('LOCAL_SCOPE_PROOF_REQUIRED');localScope=validateStartupLocalScope(scope.value,scoped.proof,targetHash,manifest.fixtureHash);refs.push(manifest.scopeEvidence);}
     if (new Set(proofs.map(item => item.proof.intent.owner.actionId)).size !== proofs.length) throw Error('DUPLICATE_PROOF');
     if (proofs.some(({ proof, batch }) => terminalTime(proof) > review.reviewedAt||manifest&&(proof.intent.controllerHash !== manifest.controllerHash || proof.intent.protocolHash !== manifest.protocolHash || proof.intent.controlHash !== manifest.controlHash || proof.intent.environmentHash !== manifest.environmentHash || batch.fixtureHash !== manifest.fixtureHash))) throw Error('REVIEW_SCOPE_CHANGED');
     // A later unresolved relevant failure invalidates historical acceptance.
@@ -230,7 +231,7 @@ export function loadStartupEvidence(store: RunStore, target: QualificationTarget
     if (rows.slice(last + 1).some(row => row.targetHash === targetHash && (row.kind === 'CAMPAIGN_FENCE' || row.kind === 'CAMPAIGN_RESULT' && body(body(row.payload).usage).status !== 'PASS'))) throw Error('LATER_FAILURE_REOPENS');
     for (const { proof } of proofs) for (const monitor of proof.monitors ?? []) if (monitor.registrationEvidence) { const registration = body(readJson(store, monitor.registrationEvidence).value); if (registration.kind !== 'effective-startup-registration' || registration.intentHash !== startupTargetHash(proof.intent) || registration.registrationHash !== monitor.registrationHash || registration.monitorHash !== monitor.monitorHash || registration.path !== monitor.path || registration.controlHash !== proof.intent.controlHash) throw Error('EFFECTIVE_REGISTRATION_UNPROVEN'); refs.push(monitor.registrationEvidence); }
     const managedAccepted=manifest?managed(store,rows,targetHash,manifest,proofs,refs):false;
-    accepted.push({ review, manifest, proofs, refs,managedAccepted });
+    accepted.push({ review, manifest, proofs, refs,managedAccepted,scope:localScope });
    } catch (error) { issues.push(error instanceof Error && /^[A-Z0-9_]+$/.test(error.message) ? error.message : 'INVALID_STARTUP_EVIDENCE'); }
   }
  } catch { issues.push('INVALID_LEDGER'); }
@@ -261,9 +262,8 @@ function covers(loaded: LoadedReview, required: readonly string[]): boolean {
  return required.every(path => STARTUP_SOURCES.every(source => ['bootstrap','thread-start'].every(lifecycle => {
   const route = manifest.routes.find(item => item.path === path && item.source === source && item.lifecycle === lifecycle); if (!route) return false;
   return proofs.some(({ proof }) => {
-   if (!proof.initialized) return false;
-   if(route.enforcement==='inapplicable')return true;
-   if(!policyMatches(proof,manifest)||lifecycle==='thread-start'&&!proof.threadStarted)return false;
+   if(!proof.initialized||!policyMatches(proof,manifest)||lifecycle==='thread-start'&&!proof.threadStarted)return false;
+   if(route.enforcement==='inapplicable'){const scope=loaded.scope;return ['browser-native','browser-cdp','computer'].includes(path)&&!!scope&&scope.client.dynamicTools==='none'&&scope.client.selectedCapabilityRoots==='none'&&scope.client.remoteEnvironments==='none';}
    if (route.enforcement === 'persistent-restriction') return true;
    const monitor = proof.monitors?.find(item => item.path === path);
    return !!monitor && !!route.registrationHash && monitor.registrationHash === route.registrationHash && !!route.monitorHash && monitor.monitorHash === route.monitorHash &&
@@ -285,7 +285,7 @@ function reviewsFor(target: QualificationTarget, evidence?: AcceptedStartupEvide
  if(!evidence||evidence.targetHash!==fingerprint(target))return [];const loaded=validated.get(evidence);if(!loaded)return [];
  try{const current=loaded.store.listQualifications();if(!current.ok||fingerprint(current.value)!==loaded.historyHash)return [];
   // Recheck accepted bytes at every evaluation, including changed source bytes.
-  for(const review of loaded.reviews)for(const pointer of review.refs)readArtifact(loaded.store,pointer);
+  for(const review of loaded.reviews)for(const pointer of review.refs)readArtifact(loaded.store,pointer,8388608);
   return loaded.reviews;
  }catch{return [];}
 }

@@ -1,3 +1,4 @@
+import {isUnlimited,remainingAllowance,type CampaignRemaining} from './campaign-policy.ts';
 import type { Result } from '../contracts/common.ts';
 import { HashSchema,IdSchema } from '../contracts/common.ts';
 import { CampaignActionSchema,CAMPAIGN_LIMITS,CAMPAIGN_BATCH_LIMITS,CampaignExecutionLimitsSchema,type CampaignAction } from './campaign.ts';
@@ -24,7 +25,7 @@ export type CampaignScheduleDeficit={scope:string;resource:keyof CampaignCost|'t
 export type CampaignScheduleBatch={id:string;groupIds:string[];actionIds:string[];dependencies:string[];cleanupReservedFirst:string[];topLevelActions:number;wallMs:number;approvalTtlMs:number;cost:CampaignCost};
 export type CampaignSchedule={schemaVersion:1;targetHash:string;retainedHash:string;inputHash:string;executionLimits?:z.infer<typeof CampaignExecutionLimitsSchema>;bill:Array<ScheduledAction&{groupId:string;catalogCredit:boolean;processes:Array<{identity:string;kind:'root'|'helper'|'standalone';maxMs:number}>}>;
  batches:CampaignScheduleBatch[];cost:CampaignCost;batchDeficits:CampaignScheduleDeficit[]};
-export type CampaignFeasibility={fits:boolean;reasons:string[];remaining:CampaignCost;required:CampaignCost;deficits:CampaignScheduleDeficit[]};
+export type CampaignFeasibility={fits:boolean;reasons:string[];remaining:CampaignRemaining;required:CampaignCost;deficits:CampaignScheduleDeficit[]};
 const zero=():CampaignCost=>({actions:0,activeMs:0,outputBytes:0});
 const count=(value:number)=>Number.isSafeInteger(value)&&value>=0;
 const cost=(value:CampaignCost)=>value&&Object.keys(value).sort().join()==='actions,activeMs,outputBytes'&&Object.values(value).every(count);
@@ -117,8 +118,8 @@ export function checkCampaignFeasibility(schedule:CampaignSchedule,retained:Camp
   if(retained.correctionRequired)reasons.push('CORRECTIVE_APPROVAL_REQUIRED');
   if(retained.externalLiabilities.some(item=>!item.bounds))reasons.push('UNBOUNDED_EXTERNAL_LIABILITY');
   const liabilities=retained.externalLiabilities.reduce((sum,item)=>add(sum,item.bounds??zero()),zero()),prior=add(add(retained.consumed,retained.reserved),liabilities);
-  const remaining={actions:limits.campaignLimits.actions-prior.actions,activeMs:limits.campaignLimits.activeMs-prior.activeMs,outputBytes:limits.campaignLimits.outputBytes-prior.outputBytes};
-  const deficits=[...schedule.batchDeficits,...(Object.keys(CAMPAIGN_LIMITS) as Array<keyof CampaignCost>).flatMap(resource=>deficit('campaign',resource,schedule.cost[resource],remaining[resource]))];
+  const remaining=remainingAllowance(limits.campaignLimits,prior,zero());
+  const deficits=[...schedule.batchDeficits,...(isUnlimited(remaining)?[]:(Object.keys(CAMPAIGN_LIMITS) as Array<keyof CampaignCost>).flatMap(resource=>deficit('campaign',resource,schedule.cost[resource],remaining[resource])))];
   return {ok:true,value:{fits:!reasons.length&&!deficits.length,reasons,remaining,required:{...schedule.cost},deficits}};
  }catch{return fail();}
 }

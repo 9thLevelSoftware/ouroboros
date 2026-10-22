@@ -41,7 +41,7 @@ it('refuses untyped process output masquerading as typed safe proof', () => {
 const must=<T>(result:Result<T>):T=>{if(!result.ok)throw Error(result.error.code);return result.value;};
 /** Deliberately synthetic durable history. Its LIVE labels exercise rejection
  * and acceptance logic only; none of these artifacts qualify a real runtime. */
-async function acceptedFixture(options:{simulation?:boolean;missingPluginRoute?:boolean;unaccepted?:boolean;selfReview?:boolean;managed?:boolean;managedWrongIntent?:boolean;strict?:boolean;forcedStrict?:boolean;wrongStrictBaseline?:boolean;nativeStrict?:boolean;nativeAcknowledged?:boolean;nativeWrongReason?:boolean;strictWithoutCoverage?:boolean;noBroker?:boolean;inapplicableBrowser?:boolean;localScope?:boolean;scopeWrongFixture?:boolean;sourceCatalog?:boolean}={}){
+async function acceptedFixture(options:{simulation?:boolean;missingPluginRoute?:boolean;unaccepted?:boolean;selfReview?:boolean;managed?:boolean;managedWrongIntent?:boolean;strict?:boolean;forcedStrict?:boolean;wrongStrictBaseline?:boolean;nativeStrict?:boolean;nativeAcknowledged?:boolean;nativeWrongReason?:boolean;strictWithoutCoverage?:boolean;noBroker?:boolean;inapplicableBrowser?:boolean;scopedInapplicable?:boolean;localScope?:boolean;scopeWrongFixture?:boolean;sourceCatalog?:boolean}={}){
  const store=openStore(mkdtempSync(join(tmpdir(),'startup-evidence-acceptance-')));stores.push(store);
  const runId=randomUUID(),repoId=randomUUID();must(store.createRun(repoId,{schemaVersion:1,id:runId,taskId:randomUUID(),phase:'CREATED',blocker:null,generation:0,baselineRef:null,candidateRef:null,sessionRef:null,repairCount:0,cumulativeBudgets:{activeMs:0,outputBytes:0,tokens:null,requests:null,money:null},pendingActionIds:[]}));
  const owner=must(store.claim(repoId,runId)),campaignId=randomUUID(),batchId=randomUUID(),metadataId=randomUUID();
@@ -74,7 +74,7 @@ async function acceptedFixture(options:{simulation?:boolean;missingPluginRoute?:
    drain:{schemaVersion:1,...intent.owner,reason:'qualification-session-terminal',requestAcknowledged:true,requestedAt:2000,acknowledgedAt:2000,rootExited:true,rootExitedAt:2001,rootExitCode:0,membershipEmpty:true,membershipObservedAt:2002,activeProcesses:0,unresolvedExecutions:[],outputComplete:true,unresolvedOutputStreams:[],outputCompletedAt:2002,childRanBeforeAssignment:false,completedAt:2002},
    dispatches:[{dispatchId:fingerprint({actionId,kind:'launch'}),sequence:1,kind:'launch',launchHash:h},{dispatchId:fingerprint({actionId,kind:'initialize'}),sequence:2,kind:'initialize',launchHash:h},{dispatchId:fingerprint({actionId,kind:'drain'}),sequence:3,kind:'drain',launchHash:h}],policy:{...policy,observedAt:1500},broker:{inventoryScope:'campaign-owned-controlled-services',registryHash:h,activeCount:0,unresolvedCount:0}};
   if(options.noBroker)delete proof.broker;
-  if(options.inapplicableBrowser){delete proof.policy;delete proof.broker;proof.threadStarted=false;}
+  if(options.inapplicableBrowser&&!options.scopedInapplicable){delete proof.policy;delete proof.broker;proof.threadStarted=false;}
   if(strictPhase){
    const nativeDrain=proof.drain;
    proof.initialized=strictPhase==='positive';proof.threadStarted=false;
@@ -96,7 +96,7 @@ async function acceptedFixture(options:{simulation?:boolean;missingPluginRoute?:
   return operation;
  }
  await action('worker.unapproved_config_inactive',true);
- if(options.localScope){const proof=StartupSessionProofSchema.parse(JSON.parse(readFileSync(join(store.root,'artifacts',observations[0]!.sha256),'utf8')));manifest.scopeEvidence=await artifact({schemaVersion:1,kind:'current-controller-reviewed-local-stdio-scope',targetHash,controllerHash:proof.intent.controllerHash,protocolHash:proof.intent.protocolHash,fixtureHash:options.scopeWrongFixture?'b'.repeat(64):h,environmentHash:h,controlHash:proof.intent.controlHash,intentHash:fingerprint(proof.intent),configuration:config,preparation:{actionId:metadataId,runId,generation:owner.generation,observedAt:1000,operation:'atomic-new-empty-directory',sqliteHomeHash:config.sqliteHomeHash,initialEntries:[]},client:{name:'ouroboros',transport:'stdio',environment:'local',threadMode:'new-only',reconfiguration:'none',remoteStartup:'resolve-persisted',allowedMethods:['initialize','initialized','account/read','config/read','configRequirements/read','thread/start','turn/start','turn/interrupt']}});}
+ if(options.localScope){const proof=StartupSessionProofSchema.parse(JSON.parse(readFileSync(join(store.root,'artifacts',observations[0]!.sha256),'utf8')));manifest.scopeEvidence=await artifact({schemaVersion:1,kind:'current-controller-reviewed-local-stdio-scope',targetHash,controllerHash:proof.intent.controllerHash,protocolHash:proof.intent.protocolHash,fixtureHash:options.scopeWrongFixture?'b'.repeat(64):h,environmentHash:h,controlHash:proof.intent.controlHash,intentHash:fingerprint(proof.intent),configuration:config,preparation:{actionId:metadataId,runId,generation:owner.generation,observedAt:1000,operation:'atomic-new-empty-directory',sqliteHomeHash:config.sqliteHomeHash,initialEntries:[]},client:{name:'ouroboros',transport:'stdio',environment:'local',threadMode:'new-only',reconfiguration:'none',remoteStartup:'resolve-persisted',dynamicTools:'none',selectedCapabilityRoots:'none',remoteEnvironments:'none',allowedMethods:['initialize','initialized','account/read','config/read','configRequirements/read','thread/start','turn/start','turn/interrupt']}});}
  if(options.strict){await action('auxiliary.strict-positive',true,'positive');await action('auxiliary.strict-negative',true,'negative');}
  if(options.managed){
   const actualProof=StartupSessionProofSchema.parse(JSON.parse(readFileSync(join(store.root,'artifacts',observations[0]!.sha256),'utf8'))),projection=createManagedPolicyConflictProjection({intentHash:options.managedWrongIntent?h:fingerprint(actualProof.intent),rawConfig,rawRequirements});
@@ -177,8 +177,8 @@ it('strict-only closure verifies its own source bytes without an unrelated start
 it('source-backed persistent restrictions do not require unrelated broker records or dummy monitors',async()=>{
  const f=await acceptedFixture({noBroker:true}),evidence=f.load();expect(evidence.issues).toEqual([]);expect(evaluateStartupBlockers(f.target,evidence).slice(0,3).every(d=>d.state==='CLOSED')).toBe(true);
 });
-it('source-proven inapplicable browser paths need actual owned startup but no policy or thread fiction',async()=>{
- const f=await acceptedFixture({inapplicableBrowser:true}),evidence=f.load();expect(evidence.issues).toEqual([]);expect(evaluateStartupBlockers(f.target,evidence).find(d=>d.id==='BROWSER_COMPUTER_STARTUP_UNPROVEN')?.state).toBe('CLOSED');expect(evaluateStartupBlockers(f.target,evidence).find(d=>d.id==='PLUGIN_STARTUP_UNPROVEN')?.state).toBe('OPEN');
+it('metadata-only inapplicability cannot substitute for observed scoped thread-start and policy',async()=>{
+ const f=await acceptedFixture({inapplicableBrowser:true}),evidence=f.load();expect(evidence.issues).toEqual([]);expect(evaluateStartupBlockers(f.target,evidence).find(d=>d.id==='BROWSER_COMPUTER_STARTUP_UNPROVEN')?.state).toBe('OPEN');expect(evaluateStartupBlockers(f.target,evidence).find(d=>d.id==='PLUGIN_STARTUP_UNPROVEN')?.state).toBe('OPEN');
 });
 it('builds source coverage from actual proof bindings and revalidates the trusted source bytes before preparation',async()=>{
  const f=await acceptedFixture(),proof=StartupSessionProofSchema.parse(JSON.parse(readFileSync(join(f.store.root,'artifacts',f.observations[0]!.sha256),'utf8')));
@@ -186,4 +186,9 @@ it('builds source coverage from actual proof bindings and revalidates the truste
  expect(manifest.expectedPolicy).toEqual(f.manifest.expectedPolicy);expect(sourceCoveredStartupPaths(manifest)).toHaveLength(13);expect(validateStartupCoverageForPreparation(f.store,f.target,h,proof.intent,manifest)).toEqual(manifest);
  expect(()=>validateStartupCoverageForPreparation(f.store,f.target,'b'.repeat(64),proof.intent,manifest)).toThrow('STARTUP_COVERAGE_BINDING_CHANGED');
  expect(()=>buildStartupCoverageManifest({target:f.target,proof:{...proof,evidenceKind:'simulation'},fixtureHash:h,routes:f.manifest.routes})).toThrow('ACTUAL_COMPATIBLE_POLICY_REQUIRED');
+});
+
+it('accepts native inapplicability only with compatible policy and verified closed local thread scope',async()=>{
+ const f=await acceptedFixture({inapplicableBrowser:true,scopedInapplicable:true,localScope:true}),evidence=f.load();expect(evidence.issues).toEqual([]);
+ expect(evaluateStartupBlockers(f.target,evidence).find(d=>d.id==='BROWSER_COMPUTER_STARTUP_UNPROVEN')?.state).toBe('CLOSED');
 });

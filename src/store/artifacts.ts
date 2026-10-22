@@ -80,8 +80,9 @@ export async function publishArtifact(store: RunStore, input: AsyncIterable<Uint
       const reserved = store.reserveOutput(m.owner, m.actionId, chunk.byteLength);
       if (!reserved.ok) return reserved;
       rawBytes += chunk.byteLength;
-      limit = reserved.value.limit;
-      await write(redactor.push(chunk.subarray(0, reserved.value.acceptedBytes)));
+      const artifactRemaining=preflight.value.artifactLimitBytes===undefined?null:Math.max(0,preflight.value.artifactLimitBytes-(rawBytes-chunk.byteLength));
+      limit = reserved.value.limit??(artifactRemaining!==null&&chunk.byteLength>=artifactRemaining?'ACTION_OUTPUT_LIMIT':null);
+      await write(redactor.push(chunk.subarray(0, Math.min(reserved.value.acceptedBytes,artifactRemaining??chunk.byteLength))));
       // for-await invokes return() on exhaustion, requesting producer stop. An
       // external process's drainage still requires independent supervisor proof.
       if (limit) break;

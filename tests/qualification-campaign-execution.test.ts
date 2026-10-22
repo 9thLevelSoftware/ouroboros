@@ -1,7 +1,7 @@
 import {createHash,randomUUID} from 'node:crypto';
 import {expect,it,vi} from 'vitest';
 import * as runtimeModule from '../src/qualification/campaign-runtime.ts';
-import {createCampaignExecutionPlan,buildCampaignExecutionProposal,executeCampaignPlan,executeCampaignUnit,campaignExecutionLaunches,CAMPAIGN_EXECUTION_PROBE_ORDER,campaignExecutionDeficits,type CampaignExecutionPlanInput} from '../src/qualification/campaign-execution.ts';
+import {createCampaignExecutionPlan,buildCampaignExecutionProposal,validateCampaignExecutionProposal,executeCampaignPlan,executeCampaignUnit,campaignExecutionLaunches,CAMPAIGN_EXECUTION_PROBE_ORDER,campaignExecutionDeficits,type CampaignExecutionPlanInput} from '../src/qualification/campaign-execution.ts';
 import {composeCampaignRuntime} from '../src/qualification/campaign-runtime.ts';
 import {campaignRecipeHash,cleanupRecipeHash} from '../src/qualification/campaign-runner.ts';
 import {createFixedDriverManifestV2} from '../src/qualification/fixed-driver-backend.ts';
@@ -119,4 +119,13 @@ it('executes one explicit terminal unit for review without rerunning earlier uni
   const report=await executeCampaignUnit(plan,'strict-pair',{campaign:{snapshot:()=>({ok:true,value:f.snapshot}),approve:()=>{calls.push('approve');return {ok:true,value:undefined};}} as any,currentAdmission:f.admit,authorizeLaunch:async()=>true,authorizeBatch:async proposal=>{calls.push(`review:${proposal.unit.id}`);return true;},now:()=>1000,current:()=>({fixtureHash:h,endpointHash:h,targetHash:f.snapshot.targetHash})});
   expect(report).toMatchObject({status:'UNIT_EXECUTED',completedUnits:['strict-pair'],probesExecuted:[],qualificationAccepted:false});expect(calls).toEqual(['review:strict-pair','approve']);
  }finally{composed.mockRestore();}
+});
+
+it('reconstructs exact frozen plan recipes and refuses fabricated plan labels and changed generated IDs',()=>{
+ const f=fixture(),plan=must(createCampaignExecutionPlan(f.input)),context=f.context(),proposal=must(buildCampaignExecutionProposal(plan,'metadata',context));
+ expect(validateCampaignExecutionProposal(plan,proposal,context)).toBe(true);
+ const altered=structuredClone(proposal);altered.runtime.batch.actions[0].maxMs--;
+ expect(validateCampaignExecutionProposal(plan,altered,context)).toBe(false);
+ const replay=structuredClone(proposal);replay.generatedIds[0]=randomUUID();
+ expect(validateCampaignExecutionProposal(plan,replay,context)).toBe(false);
 });

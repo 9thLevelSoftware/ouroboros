@@ -51,7 +51,7 @@ export function composeCampaignRuntime(raw:CampaignRuntimeProposal,options:Campa
   const supervisor=(intent:StartupIntent,expected:LaunchSpec,capture:RawCapture,gate:()=>void):Supervisor=>native({helperPath:intent.helper.path,authorize:async actual=>{
    gate();if(fingerprint(actual)!==fingerprint(expected)||!sameOwner(actual))return false;
    const authorized=await options.authorizeLaunch(freeze(structuredClone(actual)));gate();return authorized;
-  },observation:{onRawBytes:(_source,_stream,bytes)=>capture.write(bytes),onProcessCompleted:meter=>capture.processCompleted(meter),waitHelperExit:true}});
+  },observation:{onRawBytes:(source,stream,bytes)=>{capture.streamBytes?.(source,stream,bytes.length);capture.write(bytes);},onProcessCompleted:meter=>capture.processCompleted(meter),waitHelperExit:true}});
   const pending=(descriptor:PendingDispatchDescriptor|undefined,intent:StartupIntent)=>{
    if(!descriptor)return undefined;
    const parsed=PendingDispatchDescriptorSchema.parse(descriptor);

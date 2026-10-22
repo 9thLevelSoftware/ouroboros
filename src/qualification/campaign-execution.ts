@@ -1,3 +1,4 @@
+import {isUnlimited,CampaignCostSchema,type CampaignRemaining} from './campaign-policy.ts';
 import {supportedNodeVersion} from '../runtime/compatibility.ts';
 import {createHash,randomUUID} from 'node:crypto';
 import {win32} from 'node:path';
@@ -24,14 +25,9 @@ export type CampaignExecutionSnapshot=Extract<ReturnType<QualificationCampaign['
 export type CampaignExecutionBounds={sessionLifetimeMs:number;activeMs:number;sessionOutputBytes:number;resourceLifetimeMs:number;resourceOutputBytes:number;observerOutputBytes:number;cleanupMs:number;cleanupOutputBytes:number};
 export type CampaignExecutionStartup={coverage:StartupCoverageManifest;canaries:SessionCanary[]};
 export type CampaignExecutionUnit={id:string;kind:'metadata'|'strict-pair'|'probe';probeId?:string;integralProcesses:number;standaloneProcesses:number};
-const boundaryOrder=['denied_source_write','denied_controller_write','denied_sibling_write','denied_sensitive_read','allowed_proxy_network','denied_network','denied_direct_tcp','denied_loopback','link_escape','broker_escape'] as const;
-/** Task7's reviewed dependency order, independent of registry presentation. */
-export const CAMPAIGN_EXECUTION_PROBE_ORDER:readonly string[]=Object.freeze([
- 'verifier.allowed_command',...boundaryOrder.map(operation=>`verifier.${operation}`),
- 'worker.unapproved_config_inactive','worker.subscription_request','worker.correlated_lifecycle',
- 'controller.foreground_cancel','controller.detached_descendant_cancel','controller.controller_death','controller.helper_death','controller.pending_dispatch_cancel',
- 'worker.allowed_edit',...boundaryOrder.map(operation=>`worker.${operation}`),'controller.auth_stop','controller.quota_stop',
-]);
+export {CAMPAIGN_EXECUTION_PROBE_ORDER} from './campaign-order.ts';
+import {CAMPAIGN_EXECUTION_PROBE_ORDER} from './campaign-order.ts';
+
 type Cost={actions:number;activeMs:number;outputBytes:number};
 export type CampaignExecutionPlanInput={snapshot:CampaignExecutionSnapshot;prepared:PreparedCampaignFixture;node:StartupIntent['node'];env:Record<string,string>;boundaryHash:string;controlHash:string;fixtureHash:string;endpointHash:string;
  launches:{worker:Record<'networkDenied'|'networkBoundary',CodexLaunchConfigInput>;verifier:Record<'networkDenied'|'networkBoundary',CodexLaunchConfigInput>};
@@ -39,7 +35,7 @@ export type CampaignExecutionPlanInput={snapshot:CampaignExecutionSnapshot;prepa
  observer:{entryPoint:PinnedBoundaryResource;module:PinnedBoundaryResource;dependencies:PinnedBoundaryResource[]};bounds:CampaignExecutionBounds};
 export type CampaignExecutionPlan={schemaVersion:1;kind:'native-codex-windows-campaign';input:CampaignExecutionPlanInput;units:CampaignExecutionUnit[];cost:Cost;planHash:string};
 export type CampaignExecutionDeficit={scope:string;resource:keyof Cost|'topLevelActions';required:number;available:number;deficit:number};
-export type CampaignExecutionProposal={unit:CampaignExecutionUnit;runtime:CampaignRuntimeProposal;cost:Cost;deficits:CampaignExecutionDeficit[];planHash:string;recipes:CampaignRecipe[]};
+export type CampaignExecutionProposal={generatedIds:string[];unit:CampaignExecutionUnit;runtime:CampaignRuntimeProposal;cost:Cost;deficits:CampaignExecutionDeficit[];planHash:string;recipes:CampaignRecipe[]};
 export type CampaignProposalContext={snapshot:CampaignExecutionSnapshot;now:number;batchId:string;controllerExecutionId:string;currentAdmission:SessionAdapters['currentAdmission'];startup?:CampaignExecutionStartup;id?:()=>string};
 
 const freeze=<T>(value:T):T=>{if(value&&typeof value==='object'){for(const child of Object.values(value))freeze(child);Object.freeze(value);}return value;};
@@ -72,7 +68,8 @@ function checkPlan(plan:CampaignExecutionPlan):void{
 function current(plan:CampaignExecutionPlan,snapshot:CampaignExecutionSnapshot):void{
  if(fingerprint(snapshot.identity)!==fingerprint(plan.input.snapshot.identity)||snapshot.targetHash!==plan.input.prepared.targetHash||snapshot.fenced||snapshot.superseded||snapshot.reconciliationRequired||snapshot.accountingPending||snapshot.correctionRequired||snapshot.reserved.actions||snapshot.unsuccessfulCorrections>=snapshot.executionLimits.maxUnsuccessfulCorrections)throw Error('CURRENT_TERMINAL_CAMPAIGN_REQUIRED');
 }
-export function campaignExecutionDeficits(required:Cost,available:Cost,scope='campaign'):CampaignExecutionDeficit[]{
+export function campaignExecutionDeficits(required:Cost,available:CampaignRemaining,scope='campaign'):CampaignExecutionDeficit[]{
+ CampaignCostSchema.parse(required);if(isUnlimited(available))return [];
  return (['actions','activeMs','outputBytes'] as const).filter(key=>required[key]>available[key]).map(resource=>({scope,resource,required:required[resource],available:available[resource],deficit:required[resource]-available[resource]}));
 }
 
@@ -110,7 +107,7 @@ export function buildCampaignExecutionProposal(rawPlan:CampaignExecutionPlan,uni
  try{
   checkPlan(rawPlan);const plan=clone(rawPlan),input=plan.input,s=clone(context.snapshot),b=input.bounds,unit=plan.units.find(unit=>unit.id===unitId);
   current(plan,s);if(!unit||!IdSchema.safeParse(context.batchId).success||!IdSchema.safeParse(context.controllerExecutionId).success||!Number.isSafeInteger(context.now)||context.now<=0||typeof context.currentAdmission!=='function')return fail('EXECUTION_CONTEXT_INVALID');
-  const id=context.id??randomUUID,now=context.now,batchId=context.batchId,recipes:CampaignRecipe[]=[],actions:CampaignAction[]=[],prepared=input.prepared;
+  const sourceId=context.id??randomUUID,generatedIds:string[]=[],id=()=>{const value=sourceId();generatedIds.push(value);return value;},now=context.now,batchId=context.batchId,recipes:CampaignRecipe[]=[],actions:CampaignAction[]=[],prepared=input.prepared;
   const auth=(probeId:string)=>({kind:'qualification' as const,requestId:batchId,probeId,fixtureRoots:[prepared.fixtureRoot]});
   const base=(actionId:string,role:string,probeId:string,lifetime:number):LaunchSpec=>LaunchSpecSchema.parse({runId:s.identity.owner.runId,generation:s.identity.owner.generation,actionId,role,executable:input.node.path,argv:[],cwd:prepared.roots.workspace,env:input.env,boundaryHash:input.boundaryHash,authorization:auth(probeId),stdin:'pipe',leaseTtlMs:10000,deadline:now+lifetime});
   const request=(actionId:string,purpose:string,role:'worker'|'verifier'|'startup-metadata',lifetime=b.sessionLifetimeMs):SessionRequest=>{
@@ -177,11 +174,20 @@ export function buildCampaignExecutionProposal(rawPlan:CampaignExecutionPlan,uni
   }
   const allowance=s.executionLimits.batchLimits,expiresAt=now+Math.min(allowance.approvalTtlMs,b.resourceLifetimeMs+15000+b.cleanupMs);
   if(expiresAt<now+b.resourceLifetimeMs+b.cleanupMs)throw Error('EXECUTION_APPROVAL_LIFETIME_DEFICIT');
-  const batch=BatchApprovalSchema.parse({schemaVersion:2,id:batchId,campaignId:s.identity.id,owner:s.identity.owner,targetHash:s.targetHash,fixtureHash:input.fixtureHash,endpointHash:input.endpointHash,approvedAt:now,expiresAt,remaining:s.remaining,actions});
+  const batch=BatchApprovalSchema.parse({schemaVersion:isUnlimited(s.remaining)?3:2,id:batchId,campaignId:s.identity.id,owner:s.identity.owner,targetHash:s.targetHash,fixtureHash:input.fixtureHash,endpointHash:input.endpointHash,approvedAt:now,expiresAt,remaining:s.remaining,actions});
   const required=cost(actions),deficits=[...campaignExecutionDeficits(required,s.remaining),...campaignExecutionDeficits(required,{actions:1024,activeMs:allowance.activeMs,outputBytes:allowance.outputBytes},'batch')];
   const topLevel=actions.filter(action=>action.topLevel).length;if(topLevel>allowance.topLevelActions)deficits.push({scope:'batch',resource:'topLevelActions',required:topLevel,available:allowance.topLevelActions,deficit:topLevel-allowance.topLevelActions});
-  return {ok:true,value:freeze({unit,runtime:{batch,manifest:prepared.manifest,controllerExecutionId:context.controllerExecutionId,steps},cost:required,deficits,planHash:plan.planHash,recipes})};
+  return {ok:true,value:freeze({generatedIds,unit,runtime:{batch,manifest:prepared.manifest,controllerExecutionId:context.controllerExecutionId,steps},cost:required,deficits,planHash:plan.planHash,recipes})};
  }catch(error){return fail(error instanceof Error?error.message:'EXECUTION_PROPOSAL_INVALID');}
+}
+
+/** Replay the inert constructor using its recorded fresh IDs. This validates
+ * exact frozen plan semantics rather than trusting a caller's planHash label. */
+export function validateCampaignExecutionProposal(plan:CampaignExecutionPlan,proposal:CampaignExecutionProposal,context:Pick<CampaignProposalContext,'snapshot'|'currentAdmission'|'startup'>):boolean{
+ try{let used=0;if(!Array.isArray(proposal.generatedIds)||new Set(proposal.generatedIds).size!==proposal.generatedIds.length)return false;
+  const rebuilt=buildCampaignExecutionProposal(plan,proposal.unit.id,{...context,now:proposal.runtime.batch.approvedAt,batchId:proposal.runtime.batch.id,controllerExecutionId:proposal.runtime.controllerExecutionId,id:()=>proposal.generatedIds[used++]});
+  return rebuilt.ok&&used===proposal.generatedIds.length&&fingerprint(rebuilt.value)===fingerprint(proposal);
+ }catch{return false;}
 }
 
 export type CampaignExecutionLaunch={kind:'session'|'metadata'|'strict-positive'|'strict-negative'|'endpoint'|'guardian'|'controller'|'pending';spec:LaunchSpec;contingent:boolean};

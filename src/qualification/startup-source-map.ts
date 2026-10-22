@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { fingerprint } from './probes.ts';
 import { HashSchema, IdSchema } from '../contracts/common.ts';
 import type { QualificationTarget } from './ledger.ts';
 import { STARTUP_SOURCES } from './codex-startup-authority.ts';
@@ -60,6 +61,50 @@ const pathConsumers:Record<typeof STARTUP_MONITOR_PATHS[number],readonly Consume
  apps:[['codex-rs/core/src/config/mod.rs','to_mcp_config_with_loaded_plugins:apps_enabled'],['codex-rs/features/src/lib.rs','Feature::Apps'],['codex-rs/codex-mcp/src/mcp/mod.rs','host_owned_codex_apps_enabled']],
  web:[['codex-rs/core/src/config/mod.rs','resolve_web_search_mode_for_turn'],['codex-rs/core/src/tools/hosted_spec.rs','create_web_search_tool']],
 };
+/** Constructs a source-specific candidate using the independently reviewed full
+ * loader and distinct consumer gates. The returned UNREVIEWED status grants no
+ * authority; exact current bytes and the catalog digest still require review. */
+export function buildRuntimeSourceRouteCandidate(input:{commit:string;sources:readonly StartupSourcePin[]}){
+ if(!/^[a-f0-9]{40}$/.test(input.commit))throw Error('SOURCE_COMMIT_INVALID');
+ const pins=new Map<string,StartupSourcePin>();
+ for(const pin of input.sources){if(pins.has(pin.path)||!HashSchema.safeParse(pin.blobHash).success||pin.artifact.sha256!==pin.blobHash)throw Error('SOURCE_BLOB_INVALID');pins.set(pin.path,pin);}
+ type C=readonly [string,string];
+ const common:readonly C[]=[['codex-rs/config/src/loader/mod.rs','load_config_layers_state:all_eight_sources'],['codex-rs/config/src/loader/project_discovery.rs','managed_project_discovery'],['codex-rs/config/src/loader/managed_requirements.rs','load_managed_requirements_state:source_precedence'],['codex-rs/config/src/requirements_layers/stack.rs','compose_requirements:recursive_merge'],['codex-rs/core/src/config/mod.rs','ConfigBuilder::build']];
+ const pluginGates:readonly C[]=[['codex-rs/core/src/config/mod.rs','plugins_config_input:effective_feature'],['codex-rs/core-plugins/src/manager.rs','plugins_for_config:disabled_empty_load'],['codex-rs/app-server/src/message_processor.rs','plugin_bootstrap_warmups'],['codex-rs/core-plugins/src/manager.rs','start_startup_tasks:disabled_gate']];
+ const pluginContributions:readonly C[]=[['codex-rs/ext/mcp/src/plugin.rs','selected_plugin_servers:disabled_empty_map'],['codex-rs/core/src/mcp.rs','plugin_connector_snapshot:disabled_empty'],['codex-rs/ext/mcp/src/plugin_contributor.rs','local_plugin_providers'],['codex-rs/ext/mcp/src/plugin_providers.rs','PluginProviders::new:cloud_none'],['codex-rs/ext/mcp/src/cloud_plugin.rs','plugins_feature_refresh_and_contribution_gate']];
+ const mcpGates:readonly C[]=[['codex-rs/core/src/config/mod.rs','to_mcp_config_with_loaded_plugins'],['codex-rs/core/src/mcp.rs','effective_extension_and_plugin_registrations'],['codex-rs/codex-mcp/src/catalog.rs','resolved_registration_disabled_semantics'],['codex-rs/codex-mcp/src/connection_manager.rs','McpConnectionSet::new:enabled_filter'],['codex-rs/core/src/session/mcp_runtime.rs','project_selected_environment_mcp_servers:local_skip']];
+ const native:readonly C[]=[['codex-rs/features/src/lib.rs','browser_computer:requirements_only'],['codex-rs/app-server/src/extensions.rs','headless_registry:no_native_browser_computer'],['codex-rs/app-server/src/request_processors/thread_processor.rs','reserved_namespaces_dynamic_tools_selected_roots']];
+ const runtimeConsumers:Record<typeof STARTUP_MONITOR_PATHS[number],readonly C[]>={
+  plugins:pluginGates,'plugin-contributions':[...pluginGates,...pluginContributions],
+  'browser-native':native,'browser-cdp':native,computer:native,
+  'mcp-ordinary':mcpGates,'mcp-managed-cloud':[...mcpGates,...pluginContributions.slice(2)],'mcp-plugin':[...mcpGates,...pluginContributions,...pluginGates.slice(0,1)],
+  'remote-control':[['codex-rs/features/src/lib.rs','remote_control_toggle:ignored_not_enforcement'],['codex-rs/app-server/src/lib.rs','remote_control_requirements_and_stdio_startup'],['codex-rs/app-server-transport/src/transport/stdio.rs','stdio_initialize_client_name'],['codex-rs/app-server-transport/src/transport/remote_control/controller.rs','start_remote_control'],['codex-rs/app-server-transport/src/transport/remote_control/desired_state.rs','persisted_enrollment_and_scoped_resolution'],['codex-rs/app-server-transport/src/transport/remote_control/websocket.rs','RemoteControlDesiredState'],['codex-rs/state/src/runtime/remote_control.rs','get_remote_control_enrollment'],['codex-rs/rollout/src/state_db.rs','fresh_isolated_state'],['codex-rs/rollout/src/metadata.rs','session_backfill']],
+  hooks:[...pluginGates,['codex-rs/core/src/session/mod.rs','build_hooks_config'],['codex-rs/hooks/src/engine/mod.rs','disabled_and_empty_plugin_sources:empty_engine']],'legacy-notify':[['codex-rs/hooks/src/registry.rs','Hooks::from_config:independent_notify_argv'],['codex-rs/hooks/src/legacy_notify.rs','notify_hook']],
+  apps:[['codex-rs/ext/mcp/src/lib.rs','apps_disabled:remove_hosted_contribution'],['codex-rs/core/src/mcp.rs','apps_disabled:remove_compatibility'],['codex-rs/codex-mcp/src/mcp/mod.rs','apps_disabled:final_server_removal']],
+  web:[['codex-rs/core/src/tools/hosted_spec.rs','disabled:no_hosted_web_tool'],['codex-rs/ext/web-search/src/extension.rs','disabled:no_standalone_extension_or_tool']],
+ };
+ const evidence=(consumers:readonly C[]):Source[]=>{const unique=new Map<string,C>();for(const consumer of consumers)unique.set(consumer.join(':'),consumer);return [...unique.values()].map(([path,consumer])=>{const pin=pins.get(path);if(!pin)throw Error('SOURCE_SET_INCOMPLETE:'+path);return {commit:input.commit,path,blobHash:pin.blobHash,artifact:structuredClone(pin.artifact),consumer};});};
+ const semantics:Record<typeof STARTUP_MONITOR_PATHS[number],string>={
+  plugins:'The full effective loader and managed source precedence feed plugins feature state. Disabled plugins yield an empty load and suppress bootstrap startup tasks; both distinct gates and actual effective disabled observations are required at bootstrap and thread-start.',
+  'plugin-contributions':'Plugins feature disabled suppresses plugin loading, selected plugin MCP server maps, and connector snapshots. Local PluginProviders uses cloud=None; optional cloud refresh remains plugins-gated. All contribution paths require actual effective policy observations.',
+  'browser-native':'Scoped inapplicability only for observed headless local stdio, new-only closed-method client with no dynamic tools, no selected roots, no remote environments or reconfiguration. Native controls are requirements-only, not ordinary config enforcement. Plugin and MCP contribution routes remain applicable.',
+  'browser-cdp':'Scoped inapplicability only for observed headless local stdio, new-only closed-method client with no dynamic tools, no selected roots, no remote environments or reconfiguration. Native controls are requirements-only, not ordinary config enforcement. Plugin and MCP contribution routes remain applicable.',
+  computer:'Scoped inapplicability only for observed headless local stdio, new-only closed-method client with no dynamic tools, no selected roots, no remote environments or reconfiguration. Native controls are requirements-only, not ordinary config enforcement. Plugin and MCP contribution routes remain applicable.',
+  'mcp-ordinary':'The full effective loader constructs configured registrations and extensions; resolved disabled semantics survive catalog composition and enabled filtering precedes connection creation. Actual effective restrictions or valid registration monitoring at both boundaries remain required.',
+  'mcp-managed-cloud':'Managed/cloud layers participate in the full effective loader. Selected remote-environment discovery skips local environments. The local plugin provider has cloud=None; optional cloud contribution paths remain plugins-gated. This is not a claim of a global MCP disable gate.',
+  'mcp-plugin':'Effective plugins disabled yields empty selected plugin servers and connector snapshots; local provider cloud=None plus optional cloud feature gates remain independently covered. Final configured registration enablement is filtered before connection creation.',
+  'remote-control':'The remote_control feature toggle is ignored and confers no enforcement. Fresh isolated SQLite state without enabled enrollment, correct client persistence key, no enable RPC, actual disabled status, local stdio scope and complete owned drainage are required.',
+  hooks:'Effective hooks disabled AND disabled plugins with empty plugin hook sources yield an empty hooks engine; otherwise builtin handlers may remain. Require the combined observed restrictions at both admitted lifecycle boundaries.',
+  'legacy-notify':'Legacy notify is constructed independently from nonempty notify argv. Actual empty notify argv is required in addition to the effective hooks and plugin restrictions.',
+  apps:'Apps disabled removes the hosted extension contribution, prevents/removes compatibility registration, and removes the final Apps server. All consumers and actual observed effective disabled policy are required.',
+  web:'Web disabled produces no hosted search tool and also disables standalone web-search extension availability and tool contribution. Both distinct consumers and observed effective policy are required.',
+ };
+ const routes=STARTUP_MONITOR_PATHS.flatMap(path=>STARTUP_SOURCES.flatMap(source=>(['bootstrap','thread-start'] as const).map(lifecycle=>({path,source,lifecycle,enforcement:['browser-native','browser-cdp','computer'].includes(path)?'inapplicable' as const:'persistent-restriction' as const,sourceEvidence:evidence([...common,...runtimeConsumers[path]])}))));
+ const requirementsSources=STARTUP_SOURCES.map(source=>({source,sourceEvidence:evidence(common)}));
+ const sources=evidence([...common,...Object.values(runtimeConsumers).flat(),['codex-rs/protocol/src/shell_environment.rs','inherit_filter_and_runtime_additions'],['codex-rs/core/src/exec_env.rs','runtime_injected_environment_values'],['codex-rs/config/src/strict_config.rs','strict_unknown_field_rejection']]);
+ const interpretations=STARTUP_MONITOR_PATHS.map(path=>({path,semantics:semantics[path],sources:evidence([...common,...runtimeConsumers[path]])}));
+ const body={routes,requirementsSources,sources,interpretations};return {status:'UNREVIEWED' as const,...body,candidateHash:fingerprint(body)};
+}
 /** Data-only candidate builder. It retains the exact controller-reviewed scope;
  * artifact bytes, real preparation provenance and source interpretation still
  * require the existing independent accepted review before any closure. */

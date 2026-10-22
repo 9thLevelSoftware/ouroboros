@@ -1,3 +1,4 @@
+import {loadCampaignTerminal} from '../src/qualification/campaign-terminal.ts';
 import {fixtureCodexControls} from './helpers/codex-controls.ts';
 import { afterEach, expect, it } from 'vitest';
 import { mkdtempSync, readFileSync } from 'node:fs';
@@ -334,4 +335,13 @@ it('retains conservative raw output when an auxiliary recovery has exact lifetim
  const owner={runId:f.batch.owner.runId,generation:f.batch.owner.generation,actionId:id,role:'qualification-guardian'},identity={pid:50,creationIdentity:'guardian-50'},resource={owner,identity,launchHash:action.launchHash,createdAt:f.now()};await f.runner().withAuxiliary(recipe,{start:async()=>resource,stop:async()=>({...resource,exited:true,exitCode:0,outputComplete:true,completedAt:f.now()})},async()=>{throw Error('injected primary uncertainty');});
  const body={schemaVersion:2,kind:'campaign-recovery',campaignId:f.identity.id,batchId:f.batch.id,actionId:id,launchHash:action.launchHash,targetHash:f.identity.targetHash,owner:f.batch.owner,reconciled:true,rootExited:true,outputComplete:true,membershipEmpty:true,brokersReconciled:true,observation:{kind:'auxiliary-exit',launchHash:action.launchHash,owner,identity,createdAt:resource.createdAt,completedAt:f.now(),activeMs:0,exitCode:0,outputComplete:true},usage:{elapsedMs:0,outputBytes:0,status:'FAIL',evidenceKind:'fixture'}};
  const artifact=unwrap(await publishArtifact(f.store,(async function*(){yield Buffer.from(JSON.stringify(body));})(),{schemaVersion:1,id:randomUUID(),owner:f.batch.owner,actionId:id,mediaType:'application/json',secrets:[]}));unwrap(f.campaign.resolveUnknown(f.batch.id,id,{id:randomUUID(),evidence:[{id:artifact.id,sha256:artifact.sha256}]}));const row=unwrap(f.store.listQualifications()).find((entry:any)=>entry.kind==='CAMPAIGN_RESULT'&&entry.actionId===id);expect(row.payload.usage.outputBytes).toBe(action.maxOutputBytes);
+});
+
+it.each([true,false])('requires durable typed terminal ownership and both meters for successor batches: %s',async complete=>{
+ const f=await fixture(),s=f.session();(f.batch as any).schemaVersion=3;f.approve();
+ const adapters={...s.adapters,process:(capture:any)=>({...s.adapters.process(capture,()=>{}),drain:async()=>{const terminal=await s.seam.drain();if(complete){capture.processCompleted({kind:'root',identity:{pid:s.owned.pid,creationIdentity:s.owned.creationIdentity},activeMs:1});capture.processCompleted({kind:'helper',identity:{pid:s.owned.helperPid,creationIdentity:s.owned.helperCreationIdentity},activeMs:1});}return terminal;}})};
+ const result=await f.runner().runSession(s.recipe,adapters);
+ expect(f.calls).toEqual(['prepare','launch','initialize','thread','turn','fence','drain','brokers']);
+ expect(result.status).toBe(complete?'PASS':'FAIL');expect(result.unknown).toBe(!complete);
+ if(complete){const terminal=loadCampaignTerminal(f.store,f.batch,s.actions[0],result.evidence);expect(terminal.resource.kind).toBe('owned-execution');expect(terminal.processMeters).toHaveLength(2);}else expect(result.evidence.some((ref:any)=>ref.category==='terminal-observation')).toBe(false);
 });

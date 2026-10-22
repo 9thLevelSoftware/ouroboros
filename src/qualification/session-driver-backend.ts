@@ -20,7 +20,7 @@ import { PendingDispatchDescriptorSchema, type PendingDispatchDescriptor, type c
 type Pin={path:string;sha256:string};
 type Phase='BOOTSTRAP'|'PRE_THREAD'|'TURN';
 export type SessionBackendGate=(phase:Phase|'CLEANUP')=>void;
-export type SessionBackendCapture={write(bytes:Uint8Array):void;processCompleted?(meter:{kind:'root'|'helper';identity:{pid:number;creationIdentity:string};activeMs:number}):void};
+export type SessionBackendCapture={streamBytes?(source:'root'|'helper'|'controller'|'guardian',stream:'stdout'|'stderr',bytes:number):void;write(bytes:Uint8Array):void;processCompleted?(meter:{kind:'root'|'helper';identity:{pid:number;creationIdentity:string};activeMs:number}):void};
 export type SessionFilePrimitives={readFile(path:string):Promise<Uint8Array>;writeFile(path:string,bytes:Uint8Array,flags:'wx'|'w'):Promise<void>;appendFile(path:string,bytes:Uint8Array):Promise<void>;realpath(path:string):Promise<string>};
 export type SessionCanary={path:typeof INACTIVITY_PATHS[number];sentinel:string;baselineHash:string;registrations:Array<Pin&{source?:typeof STARTUP_SOURCES[number]}>;
  /** Reviewed applicable-source provenance supplements actual configured canaries;
@@ -202,7 +202,7 @@ export function createSessionBackend(input:SessionBackendOptions){
      transport=new CodexTransport(wire,{timeoutMs:Math.min(15000,timeout),initializationTimeoutMs:initializationAllowance(bootstrap.expiresAt),maxOutputBytes:intent.budget.outputBytes,...(clientName?{metadata:{cwd:intent.workspace,clientName,admissionDeadline:intent.expiresAt,now}}:{observeThreadSettings:true})});transport.onMessage(consume);transport.onFailure(()=>{failed=true;wake();});}
     // A single underlying listener charges raw bytes before either retention or parsing.
     // Install it only after the parser has registered, preserving early output.
-    stopCapture=owned.onOutput(output=>{capture.write(output.data);if(output.stream==='stderr'){if(Buffer.byteLength(stderr)+output.data.length>16384)failure('STRICT_STDERR_LIMIT');stderr+=new TextDecoder('utf-8',{fatal:true}).decode(output.data);}for(const listener of forwarders)listener(output);});
+    stopCapture=owned.onOutput(output=>{capture.streamBytes?.('root',output.stream,output.data.length);capture.write(output.data);if(output.stream==='stderr'){if(Buffer.byteLength(stderr)+output.data.length>16384)failure('STRICT_STDERR_LIMIT');stderr+=new TextDecoder('utf-8',{fatal:true}).decode(output.data);}for(const listener of forwarders)listener(output);});
     lease=setInterval(()=>{if(!drained&&!fenced){try{guard(wirePhase);void owned!.renewLease(++leaseSequence).catch(()=>{failed=true;wake();});}catch{failed=true;wake();}}},2000);lease.unref();return structuredClone(actual);},
    async initialize(){current();const bootstrap=guard('BOOTSTRAP');let timer:ReturnType<typeof setTimeout>|undefined;
     // A direct caller may wait after launch. Bound the pending initialization

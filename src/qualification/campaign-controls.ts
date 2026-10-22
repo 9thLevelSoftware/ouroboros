@@ -55,7 +55,7 @@ export function createCampaignControls(input:Options):{currentAdmission:SessionA
  if(new Set(launches.map(launch=>launch.actionId)).size!==launches.length)throw Error('DUPLICATE_LAUNCH');
  const pinMatches=(path:string,sha256:string)=>controls.pins.some(pin=>pin.path===path&&pin.sha256===sha256);
  const sourceBytes=()=>{for(const ref of controls.sourceArtifacts??[]){const loaded=input.campaign.store.loadArtifact(ref.id);if(!loaded.ok)throw Error('SOURCE_MISSING');const artifact=loaded.value;
-  if(artifact.sha256!==ref.sha256||artifact.truncated||artifact.producerStopRequired||artifact.redactionApplied||artifact.rawBytes!==artifact.storedBytes||artifact.storedBytes>262144)throw Error('SOURCE_INCOMPLETE');
+  if(artifact.sha256!==ref.sha256||artifact.truncated||artifact.producerStopRequired||artifact.redactionApplied||artifact.rawBytes!==artifact.storedBytes||artifact.storedBytes>8388608)throw Error('SOURCE_INCOMPLETE');
   const bytes=readFileSync(join(input.campaign.store.root,'artifacts',artifact.sha256));if(bytes.length!==artifact.storedBytes||hash(bytes)!==ref.sha256)throw Error('SOURCE_CHANGED');}};
  const current=()=>{
   const at=now();if(!Number.isSafeInteger(at)||at<grant.issuedAt||at>=grant.expiresAt||at<batch.approvedAt||at>=batch.expiresAt||!same(input.currentGrant(),grant)||!same(input.currentInputs(),{targetHash:batch.targetHash,fixtureHash:batch.fixtureHash,endpointHash:batch.endpointHash}))throw Error('CURRENT_GRANT_REQUIRED');

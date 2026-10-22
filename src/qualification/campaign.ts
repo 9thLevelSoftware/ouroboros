@@ -16,6 +16,8 @@ import { createHash } from 'node:crypto';
 import { QualificationTargetSchema, targetFingerprint, type QualificationTarget } from './ledger.ts';
 import {AccountingEvidenceSchema,CampaignAccountingSchema,deriveAccounting,readAccountingEvidence,type AccountingEvidence,type CampaignAccounting} from './campaign-accounting.ts';
 
+import {CampaignCostSchema,CampaignRemainingSchema,UnlimitedAllowanceSchema,isUnlimited,remainingAllowance,exceedsAllowance} from './campaign-policy.ts';
+
 const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const positive = count.positive();
 const Allowance = z.strictObject({ actions: count, activeMs: count, outputBytes: count });
@@ -23,15 +25,21 @@ export const CAMPAIGN_LIMITS = Object.freeze({ actions: 96, activeMs: 2400000, o
 export const CAMPAIGN_BATCH_LIMITS = Object.freeze({topLevelActions:4 as const,activeMs:150000,outputBytes:262144,approvalTtlMs:600000});
 // Larger envelopes are readable only so an explicitly authorized immutable
 // allowance can select them. Absent that allowance the original limits apply.
-export const CampaignExecutionLimitsSchema=z.strictObject({
+const BatchLimitsSchema=z.strictObject({topLevelActions:z.literal(4),activeMs:positive.max(600000),outputBytes:positive.max(67108864),approvalTtlMs:positive.max(600000)});
+const LegacyExecutionLimitsSchema=z.strictObject({
  campaignLimits:z.strictObject({actions:positive.max(1024),activeMs:positive.max(86400000),outputBytes:positive.max(1073741824)}),
- batchLimits:z.strictObject({topLevelActions:z.literal(4),activeMs:positive.max(600000),outputBytes:positive.max(67108864),approvalTtlMs:positive.max(600000)}),
- maxUnsuccessfulCorrections:count.max(1024),
+ batchLimits:BatchLimitsSchema,maxUnsuccessfulCorrections:count.max(1024),
 }).superRefine((limits,ctx)=>{if(limits.batchLimits.activeMs>limits.campaignLimits.activeMs||limits.batchLimits.outputBytes>limits.campaignLimits.outputBytes)ctx.addIssue({code:'custom',message:'Batch cannot exceed campaign allowance'});});
-export const CampaignExecutionPolicySchema=z.strictObject({schemaVersion:z.literal(1),kind:z.literal('human-execution-allowance'),id:IdSchema,
+export const UnlimitedExecutionLimitsSchema=z.strictObject({campaignLimits:UnlimitedAllowanceSchema,batchLimits:BatchLimitsSchema,maxUnsuccessfulCorrections:count.max(1024)});
+export const CampaignExecutionLimitsSchema=z.union([LegacyExecutionLimitsSchema,UnlimitedExecutionLimitsSchema]);
+const ExecutionPolicyFields={kind:z.literal('human-execution-allowance'),id:IdSchema,
  campaignId:IdSchema,owner:OwnerTokenSchema,storeRootHash:HashSchema,historyHash:HashSchema,targetHash:HashSchema,
- approvalInstruction:z.string().min(1).max(16384),limits:CampaignExecutionLimitsSchema,
- continuation:z.strictObject({supersedesCampaignId:IdSchema,priorTargetHash:HashSchema,failedActionIds:z.array(IdSchema).max(1024)}).optional()});
+ approvalInstruction:z.string().min(1).max(16384),
+ continuation:z.strictObject({supersedesCampaignId:IdSchema,priorTargetHash:HashSchema,failedActionIds:z.array(IdSchema).max(1024)}).optional()};
+export const CampaignExecutionPolicySchema=z.discriminatedUnion('schemaVersion',[
+ z.strictObject({schemaVersion:z.literal(1),...ExecutionPolicyFields,limits:LegacyExecutionLimitsSchema}),
+ z.strictObject({schemaVersion:z.literal(2),...ExecutionPolicyFields,limits:UnlimitedExecutionLimitsSchema}),
+]);
 export type CampaignExecutionPolicy=z.infer<typeof CampaignExecutionPolicySchema>;
 const defaultExecutionLimits=()=>({campaignLimits:{...CAMPAIGN_LIMITS},batchLimits:{...CAMPAIGN_BATCH_LIMITS},maxUnsuccessfulCorrections:2});
 export const CampaignLineageSchema=z.strictObject({storeRootHash:HashSchema,historyHash:HashSchema,rootId:IdSchema});
@@ -45,11 +53,15 @@ export type CampaignAction = z.infer<typeof CampaignActionSchema>;
 export const CampaignProbeEvidenceSchema=z.strictObject({schemaVersion:z.literal(2),kind:z.literal('campaign-probe'),targetHash:HashSchema,
  probeId:z.string(),role:z.enum(['worker','verifier','controller']),launchHash:HashSchema,status:z.enum(['PASS','FAIL','UNTESTED']),actualAttempt:z.boolean(),
  evidenceKind:z.enum(['fixture','live','fault_injection']),proof:z.json().optional()});
-export const BatchApprovalSchema = z.strictObject({ schemaVersion: z.literal(2), id: IdSchema, campaignId: IdSchema, owner: OwnerTokenSchema,
+const BatchApprovalFields={id: IdSchema, campaignId: IdSchema, owner: OwnerTokenSchema,
  targetHash: HashSchema, fixtureHash: HashSchema, endpointHash: HashSchema, approvedAt: positive, expiresAt: positive,
- remaining: Allowance, actions: z.array(CampaignActionSchema).min(1).max(1024),
+ actions: z.array(CampaignActionSchema).min(1).max(1024),
  correction: z.strictObject({ candidateId: IdSchema, evidenceIds: z.array(IdSchema).min(1), affectedActionId: IdSchema,
-  replacementActionId:IdSchema.optional() }).optional() });
+  replacementActionId:IdSchema.optional() }).optional()};
+export const BatchApprovalSchema=z.discriminatedUnion('schemaVersion',[
+ z.strictObject({schemaVersion:z.literal(2),...BatchApprovalFields,remaining:Allowance}),
+ z.strictObject({schemaVersion:z.literal(3),...BatchApprovalFields,remaining:CampaignRemainingSchema}),
+]);
 export type BatchApproval = z.infer<typeof BatchApprovalSchema>;
 const Usage = z.strictObject({ elapsedMs: count, outputBytes: count, status: z.enum(['PASS', 'FAIL', 'UNTESTED']), evidenceKind: z.enum(['fixture', 'live', 'fault_injection']),
  evidence: z.array(z.strictObject({ id: IdSchema, sha256: HashSchema, category: z.string().min(1) })).optional() });
@@ -161,6 +173,7 @@ export class QualificationCampaign {
   try{
    const policy=this.#executionPolicy(identity);
    if(policy){
+    if(policy.schemaVersion===2&&policy.limits.maxUnsuccessfulCorrections!==2)throw Error('Unlimited policy cannot change the unsuccessful repair ceiling');
     if(policy.limits.maxUnsuccessfulCorrections>unsuccessfulCorrections+2)throw Error('At most two additional unsuccessful corrections per allowance');
     if(policy.continuation){
      const prior=priorRow&&this.#state(priorRow.requestId);
@@ -169,7 +182,8 @@ export class QualificationCampaign {
     if(this.options.authorizeExecutionPolicy?.(freeze(clone(policy)))!==true)return storeError('EXECUTION_POLICY_NOT_AUTHORIZED','Explicit protected human allowance and trusted authorization required');
    }
   }catch{return storeError('INVALID_EXECUTION_POLICY','Unchanged protected allowance, exact lineage and bounded continuation required');}
-  return this.#metadata(identity.owner, identity.id, identity.targetHash, 'CAMPAIGN', { identity, historical, correctionUsage, unsuccessfulCorrections,failures,historicalFailures,correctionIds,accountingIds,accountingSources,accountingPending, historicalDigest: fingerprint(records.value) }, records.value.filter(r=>r.runId===identity.owner.runId).length,records.value.length);
+  const created=this.#metadata(identity.owner, identity.id, identity.targetHash, 'CAMPAIGN', { identity, historical, correctionUsage, unsuccessfulCorrections,failures,historicalFailures,correctionIds,accountingIds,accountingSources,accountingPending, historicalDigest: fingerprint(records.value) }, records.value.filter(r=>r.runId===identity.owner.runId).length,records.value.length);
+  if(!created.ok)return created;return identity.executionPolicy&&this.#executionPolicy(identity)?.schemaVersion===2?this.store.activateUnlimitedQualification(identity.owner,identity.id):created;
  }
  #state(id: string): Result<State> {
   const records = this.store.listQualifications(); if (!records.ok) return records;
@@ -226,8 +240,8 @@ export class QualificationCampaign {
    if (e?.result) { consumed.actions++; consumed.activeMs += e.result.elapsedMs; consumed.outputBytes += e.result.outputBytes; }
    else { reserved.actions++; reserved.activeMs += a.maxMs; reserved.outputBytes += a.maxOutputBytes; }
   }
-  const limits=s.executionLimits.campaignLimits;
-  const remaining = { actions: Math.max(0, limits.actions - consumed.actions - reserved.actions), activeMs: Math.max(0, limits.activeMs - consumed.activeMs - reserved.activeMs), outputBytes: Math.max(0, limits.outputBytes - consumed.outputBytes - reserved.outputBytes) };
+  CampaignCostSchema.parse(consumed);CampaignCostSchema.parse(reserved);
+  const remaining=remainingAllowance(s.executionLimits.campaignLimits,consumed,reserved);
   return { consumed, reserved, remaining };
  }
  snapshot(id: string) { const s = this.#state(id); return s.ok ? { ok: true as const, value: this.#publicSnapshot(s.value) } : s; }
@@ -258,7 +272,7 @@ export class QualificationCampaign {
   });
   if (s.fenced || s.reconciliationRequired || s.accountingPending || s.entries.some(e=>!e.result)) return storeError('RECOVERY_REQUIRED', 'Campaign stopped, accounting incomplete or already executing; explicit reconciliation required after uncertainty');
   if (!equal(b.owner,s.identity.owner) || b.targetHash !== s.targetHash || !equal(b.remaining, remaining) || b.approvedAt > this.#now() || b.expiresAt <= this.#now() || b.expiresAt <= b.approvedAt || b.expiresAt - b.approvedAt > limits.approvalTtlMs ||
-   invalidClassification||b.actions.filter(a => a.topLevel).length > limits.topLevelActions || total.activeMs > limits.activeMs || total.outputBytes > limits.outputBytes || total.actions > remaining.actions || total.activeMs > remaining.activeMs || total.outputBytes > remaining.outputBytes ||
+   invalidClassification||b.actions.filter(a => a.topLevel).length > limits.topLevelActions || total.activeMs > limits.activeMs || total.outputBytes > limits.outputBytes || exceedsAllowance(total,remaining) ||
    new Set(b.actions.map(a => a.id)).size !== b.actions.length || b.actions.some(a => usedIds.includes(a.id) || a.kind !== 'cleanup' && (!a.cleanupId || !b.actions.some(c => c.id === a.cleanupId && c.kind === 'cleanup')) || a.kind === 'cleanup' && (a.topLevel || a.cleanupId) || a.probeId && (a.kind !== 'probe' || !REQUIRED_CODEX_WINDOWS_PROBES.some(p => p.id === a.probeId))))
    return storeError('INVALID_BATCH', 'Scope, expiry, reserve, target or cumulative allowance mismatch');
   if (s.unsuccessfulCorrections >= s.executionLimits.maxUnsuccessfulCorrections || s.correctionRequired && !b.correction) return storeError('CORRECTION_APPROVAL_REQUIRED', 'Separate corrective approval required; unsuccessful corrections cannot exceed the explicit allowance');

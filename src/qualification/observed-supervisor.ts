@@ -72,7 +72,7 @@ export function createObservedSupervisor(input:Options,primitives:Primitives={re
    const binding:QualificationObservationLaunchBinding={...launchBinding,...(other?{unrelated:other}:{})};
    observer=createQualificationObserver({...binding,authorizeStart:async actual=>{
     if(!same(actual,binding))fail('OBSERVATION_BINDING_MISMATCH');await checkPins();if(!same(unrelated(),other))fail('OWNED_UNRELATED_CHANGED');gates.guardian();gates.controller();return true;
-   },onRawBytes:(source,_stream,bytes)=>{if(source==='guardian')captures.guardian.write(bytes);else if(source==='controller')captures.controller.write(bytes);else{if(!rootCapture)fail('UNOWNED_HELPER_OUTPUT');rootCapture.write(bytes);}}});
+   },onRawBytes:(source,stream,bytes)=>{if(source==='guardian'){captures.guardian.streamBytes?.(source,stream,bytes.length);captures.guardian.write(bytes);}else if(source==='controller'){captures.controller.streamBytes?.(source,stream,bytes.length);captures.controller.write(bytes);}else{if(!rootCapture)fail('UNOWNED_HELPER_OUTPUT');rootCapture.streamBytes?.(source,stream,bytes.length);rootCapture.write(bytes);}}});
    const receipt=await observer.start();
    const make=(kind:'guardian'|'controller')=>({owner:owner(recipes[kind].launch),identity:receipt[kind==='guardian'?'observer':'controller'],launchHash:campaignRecipeHash(recipes[kind]),createdAt:receipt.capturedAt});
    resources={guardian:make('guardian'),controller:make('controller')};
@@ -86,7 +86,7 @@ export function createObservedSupervisor(input:Options,primitives:Primitives={re
     try{
      const spec=LaunchSpecSchema.parse(request);if(launched||stopped||!resources||!same(spec,root))fail('OBSERVED_ROOT_LAUNCH_MISMATCH');
      await checkPins();effectGate('BOOTSTRAP');launched=true;rootCapture=capture;
-     const config=validate();const execution=await connectDisposableController(client.controller,spec,{deadline:spec.deadline,moduleHash:config.module.sha256,now:primitives.now,effectGate:kind=>effectGate(kind==='CLEANUP'?'CLEANUP':'BOOTSTRAP'),onRawOutput:listener=>client.onRawOutput(listener),onHelperRawBytes:(_stream,bytes)=>capture.write(bytes)});
+     const config=validate();const execution=await connectDisposableController(client.controller,spec,{deadline:spec.deadline,moduleHash:config.module.sha256,now:primitives.now,effectGate:kind=>effectGate(kind==='CLEANUP'?'CLEANUP':'BOOTSTRAP'),onRawOutput:listener=>client.onRawOutput(listener),onHelperRawBytes:(stream,bytes)=>{capture.streamBytes?.('helper',stream,bytes.length);capture.write(bytes);}});
      return {ok:true,value:execution};
     }catch{return {ok:false,error:{code:'OBSERVED_ROOT_REFUSED',message:'Exact observed root launch failed or lost current admission',evidenceIds:[]}};}
    }};
